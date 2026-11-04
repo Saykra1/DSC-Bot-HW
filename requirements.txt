@@ -8,3 +8,4 @@ pydantic==2.13.5
 pydantic-settings==2.16.2
 python-multipart==0.0.33
 tzdata==2026.6
+aiohttp-socks==0.12.0

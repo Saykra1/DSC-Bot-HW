@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     bot_token: str = ""
     # Telegram ID организаторов через запятую: 123,456
     admin_ids: Annotated[list[int], NoDecode] = []
+    # Прокси для api.telegram.org, если он недоступен напрямую: http://host:port или socks5://host:port
+    bot_proxy: str = ""
     # HTTPS-адрес, по которому открывается мини апп (например, адрес туннеля cloudflared)
     webapp_url: str = ""
 

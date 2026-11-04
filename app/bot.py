@@ -9,6 +9,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -46,8 +47,10 @@ class NewAssignment(StatesGroup):
     settings = State()
 
 
-def build_bot(token: str) -> Bot:
-    return Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+def build_bot(token: str, proxy: str = "") -> Bot:
+    # proxy: http://host:port или socks5://user:pass@host:port — если api.telegram.org недоступен напрямую
+    session = AiohttpSession(proxy=proxy) if proxy else None
+    return Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 
 def make_notifier(bot: Bot):
