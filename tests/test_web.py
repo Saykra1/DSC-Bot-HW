@@ -1,0 +1,184 @@
+import hashlib
+import hmac
+import json
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import urlencode
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.config import Settings
+from app.db import init_db, make_engine, make_sessionmaker
+from app.service import HomeworkService
+from app.web import build_app
+from tests.test_checker import REFERENCE, TEMPLATE, FakeLLM, make_student
+
+BOT_TOKEN = "123456:TEST-token"
+ADMIN = 1
+STUDENT = 2
+
+
+def init_data(user_id: int, token: str = BOT_TOKEN, auth_date: int | None = None) -> str:
+    fields = {
+        "auth_date": str(auth_date or int(time.time())),
+        "query_id": "q",
+        "user": json.dumps({"id": user_id, "first_name": "Test", "username": f"user{user_id}"}),
+    }
+    check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    return urlencode(fields)
+
+
+def hdr(user_id: int) -> dict:
+    return {"X-Telegram-Init-Data": init_data(user_id)}
+
+
+@pytest.fixture
+def ctx(tmp_path: Path):
+    settings = Settings(_env_file=None, bot_token=BOT_TOKEN, admin_ids=[ADMIN], data_dir=tmp_path, default_max_attempts=2)
+    engine = make_engine(settings.db_url)
+    service = HomeworkService(settings, make_sessionmaker(engine), FakeLLM())
+    sent: list[tuple[int, list[str]]] = []
+
+    async def notifier(tg_id, messages):
+        sent.append((tg_id, messages))
+
+    service.notifier = notifier
+
+    @asynccontextmanager
+    async def lifespan(app):
+        await init_db(engine)
+        await service.start()
+        yield
+        await service.stop()
+        await engine.dispose()
+
+    app = build_app(service, None, lifespan)
+    with TestClient(app) as client:
+        yield client, service, sent
+
+
+def create_assignment(client) -> int:
+    r = client.post(
+        "/api/admin/assignments",
+        headers=hdr(ADMIN),
+        data={"title": "Предобработка", "description": "desc"},
+        files={"template": ("t.ipynb", TEMPLATE), "reference": ("r.ipynb", REFERENCE)},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["tasks"]) == 2 and body["warnings"] == []
+    return body["id"]
+
+
+def wait_done(client, sid: int, user: int) -> dict:
+    for _ in range(100):
+        r = client.get(f"/api/submissions/{sid}", headers=hdr(user)).json()
+        if r["status"] in ("done", "error"):
+            return r
+        time.sleep(0.05)
+    raise AssertionError("submission not processed")
+
+
+def test_auth_required_and_signature_checked(ctx):
+    client, _, _ = ctx
+    assert client.get("/api/me").status_code == 401
+    bad = {"X-Telegram-Init-Data": init_data(STUDENT, token="999:other")}
+    assert client.get("/api/me", headers=bad).status_code == 401
+    old = {"X-Telegram-Init-Data": init_data(STUDENT, auth_date=int(time.time()) - 3 * 24 * 3600)}
+    assert client.get("/api/me", headers=old).status_code == 401
+    r = client.get("/api/me", headers=hdr(STUDENT))
+    assert r.json() == {"id": STUDENT, "is_admin": False, "bot_enabled": False}
+
+
+def test_student_cannot_use_admin_api(ctx):
+    client, _, _ = ctx
+    r = client.post("/api/admin/assignments", headers=hdr(STUDENT), data={"title": "x"},
+                    files={"template": ("t.ipynb", TEMPLATE), "reference": ("r.ipynb", REFERENCE)})
+    assert r.status_code == 403
+
+
+def test_full_flow(ctx):
+    client, service, sent = ctx
+    aid = create_assignment(client)
+
+    lst = client.get("/api/assignments", headers=hdr(STUDENT)).json()
+    assert lst[0]["id"] == aid and lst[0]["attempts_used"] == 0 and lst[0]["max_score"] == 20
+
+    tpl = client.get(f"/api/assignments/{aid}/template", headers=hdr(STUDENT))
+    assert tpl.status_code == 200 and json.loads(tpl.content)["cells"]
+
+    student = make_student({14: "X_train['weight'] = X_train['weight'].fillna(1)\n"})
+    r = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", student)})
+    assert r.status_code == 200, r.text
+    res = wait_done(client, r.json()["id"], STUDENT)
+    assert res["status"] == "done"
+    assert res["score"] == 8 and res["max_score"] == 20
+    assert res["result"]["tasks"][1]["verdict"] == "not_done"
+
+    # уведомление ушло участнику
+    assert sent and sent[-1][0] == STUDENT and "8/20" in sent[-1][1][0]
+
+    # чужую сдачу смотреть нельзя, организатору можно
+    assert client.get(f"/api/submissions/{res['id']}", headers=hdr(3)).status_code == 403
+    assert client.get(f"/api/submissions/{res['id']}", headers=hdr(ADMIN)).json()["user"]["tg_id"] == STUDENT
+
+    # второй попыткой сдаём эталон, третья уже не принимается (лимит 2)
+    r2 = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", REFERENCE)})
+    assert wait_done(client, r2.json()["id"], STUDENT)["score"] == 20
+    r3 = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", REFERENCE)})
+    assert r3.status_code == 400 and "Попытки закончились" in r3.json()["detail"]
+
+    csv_text = client.get(f"/api/admin/assignments/{aid}/export.csv", headers=hdr(ADMIN)).content.decode("utf-8-sig")
+    lines = csv_text.strip().splitlines()
+    assert lines[0].startswith("tg_id") and lines[1].startswith(f"{STUDENT},user{STUDENT}") and ",20,20,2," in lines[1]
+
+
+def test_rejects_bad_files_and_closed_assignment(ctx):
+    client, _, _ = ctx
+    aid = create_assignment(client)
+    r = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", b"garbage")})
+    assert r.status_code == 400
+    r = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.py", TEMPLATE)})
+    assert r.status_code == 400
+
+    client.patch(f"/api/admin/assignments/{aid}", headers=hdr(ADMIN), data={"is_active": "false"})
+    assert client.get("/api/assignments", headers=hdr(STUDENT)).json() == []
+    r = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", TEMPLATE)})
+    assert r.status_code == 400 and "закрыт" in r.json()["detail"]
+
+
+def test_deadline(ctx):
+    client, _, _ = ctx
+    r = client.post(
+        "/api/admin/assignments", headers=hdr(ADMIN),
+        data={"title": "Старое", "deadline": "2020-01-01T10:00"},
+        files={"template": ("t.ipynb", TEMPLATE), "reference": ("r.ipynb", REFERENCE)},
+    )
+    aid = r.json()["id"]
+    r = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", TEMPLATE)})
+    assert r.status_code == 400 and "Дедлайн" in r.json()["detail"]
+
+
+def test_llm_failure_marks_error_and_does_not_burn_attempt(ctx):
+    client, service, sent = ctx
+    aid = create_assignment(client)
+
+    class Broken:
+        async def complete_json(self, system, user):
+            raise RuntimeError("rate limit")
+
+    service.llm = Broken()
+    student = make_student({14: "x = 1\n"})
+    r = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", student)})
+    res = wait_done(client, r.json()["id"], STUDENT)
+    assert res["status"] == "error" and res["error"] is None  # участнику текст ошибки не показываем
+    assert client.get("/api/assignments", headers=hdr(STUDENT)).json()[0]["attempts_used"] == 0
+    assert any(tg == ADMIN for tg, _ in sent)
+
+    service.llm = FakeLLM()
+    client.post(f"/api/admin/submissions/{res['id']}/recheck", headers=hdr(ADMIN))
+    assert wait_done(client, res["id"], STUDENT)["status"] == "done"

@@ -1,0 +1,9 @@
+aiogram==3.31.0
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+SQLAlchemy[asyncio]==2.1.8
+aiosqlite==0.22.1
+openai==3.45.0
+pydantic==2.13.5
+pydantic-settings==2.16.2
+python-multipart==0.0.33
