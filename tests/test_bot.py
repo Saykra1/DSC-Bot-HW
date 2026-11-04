@@ -159,3 +159,18 @@ async def test_profile_and_admin_review_commands(env):
     await send(ADMIN, f"/sub {sub.id}")
     texts = "\n".join(session.texts()[-4:])
     assert "Кот" in texts and "Иванов Иван Иванович" in texts and "Комментарий организатора" in texts
+
+
+async def test_admin_changes_webapp_url(env):
+    service, session, send, press = env
+    from aiogram.methods import SetChatMenuButton
+    await send(STUDENT, "/webapp https://evil.example")
+    assert service.webapp_url == ""
+    await send(ADMIN, "/webapp http://insecure")
+    assert "❌" in session.texts()[-1]
+    await send(ADMIN, "/webapp https://new.pinggy.link/")
+    assert service.webapp_url == "https://new.pinggy.link"
+    assert any(isinstance(r, SetChatMenuButton) and r.menu_button.web_app.url == "https://new.pinggy.link" for r in session.requests)
+    await send(STUDENT, "/start")
+    kb = session.requests[-1].reply_markup
+    assert kb.inline_keyboard[0][0].web_app.url == "https://new.pinggy.link"

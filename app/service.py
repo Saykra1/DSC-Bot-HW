@@ -117,6 +117,29 @@ class HomeworkService:
     def is_admin(self, tg_id: int) -> bool:
         return self.settings.is_admin(tg_id)
 
+    # ---------- адрес мини аппа ----------
+    # Адрес туннеля часто меняется, поэтому организатор может обновить его командой /webapp без перезапуска.
+    # Он сохраняется в data/webapp_url.txt и имеет приоритет над WEBAPP_URL из .env.
+
+    @property
+    def _webapp_file(self) -> Path:
+        return self.settings.data_dir / "webapp_url.txt"
+
+    @property
+    def webapp_url(self) -> str:
+        try:
+            saved = self._webapp_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            saved = ""
+        return saved or self.settings.webapp_url
+
+    def set_webapp_url(self, url: str) -> str:
+        url = url.strip().rstrip("/")
+        if not url.startswith("https://") or " " in url:
+            raise ServiceError("Нужен адрес, начинающийся с https://")
+        self._webapp_file.write_text(url, encoding="utf-8")
+        return url
+
     async def get_user(self, tg_id: int) -> User:
         async with self.sm() as s:
             user = await s.get(User, tg_id)

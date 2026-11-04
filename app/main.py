@@ -21,7 +21,7 @@ from app.web import build_app
 log = logging.getLogger("app")
 
 
-async def run_bot(bot, dp, webapp_url: str) -> None:
+async def run_bot(bot, dp, service: HomeworkService) -> None:
     """Подключается к Telegram и держит polling. При обрыве связи повторяет попытки, а не умирает молча."""
     delay = 5
     while True:
@@ -29,7 +29,7 @@ async def run_bot(bot, dp, webapp_url: str) -> None:
             me = await bot.get_me()
             log.info("Бот @%s подключён к Telegram", me.username)
             try:
-                await setup_bot_ui(bot, webapp_url)
+                await setup_bot_ui(bot, service.webapp_url)
             except Exception:  # noqa: BLE001
                 log.exception("Не удалось настроить меню бота")
             await dp.start_polling(bot, handle_signals=False)
@@ -85,7 +85,7 @@ def create_app():
         polling = None
         if bot is not None:
             service.notifier = make_notifier(bot)
-            polling = asyncio.create_task(run_bot(bot, dp, settings.webapp_url))
+            polling = asyncio.create_task(run_bot(bot, dp, service))
         try:
             yield
         finally:

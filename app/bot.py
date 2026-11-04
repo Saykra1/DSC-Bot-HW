@@ -84,10 +84,11 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         await service.upsert_user(user.id, user.username, user.full_name)
 
     def webapp_kb() -> InlineKeyboardMarkup | None:
-        if not webapp_url:
+        url = service.webapp_url or webapp_url
+        if not url:
             return None
         return InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="📱 Открыть мини апп", web_app=WebAppInfo(url=webapp_url))]]
+            inline_keyboard=[[InlineKeyboardButton(text="📱 Открыть мини апп", web_app=WebAppInfo(url=url))]]
         )
 
     def is_admin(m: Message | CallbackQuery) -> bool:
@@ -443,6 +444,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             "/recheck &lt;id&gt; — перепроверить сдачу",
             "/score &lt;id&gt; &lt;задание&gt;=&lt;балл&gt; … — изменить баллы, например <code>/score 12 2=8 3=10</code>",
             "/comment &lt;id&gt; &lt;текст&gt; — комментарий участнику от организатора",
+            "/webapp &lt;https://адрес&gt; — сменить адрес мини аппа (после перезапуска туннеля)",
             "Удобнее всего всё это делать в мини аппе.",
             "",
         ]
@@ -527,6 +529,32 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             await message.answer(escape(str(e)))
             return
         await message.answer("Отправил на перепроверку, результат придёт участнику.")
+
+    @router.message(Command("webapp"))
+    async def webapp_cmd(message: Message, command: CommandObject, bot: Bot):
+        if not is_admin(message):
+            return
+        if not command.args:
+            await message.answer(
+                f"Сейчас мини апп открывается по адресу:\n{escape(service.webapp_url or '— не задан')}\n\n"
+                "Сменить (например, после перезапуска туннеля): <code>/webapp https://новый-адрес</code>"
+            )
+            return
+        try:
+            url = service.set_webapp_url(command.args)
+        except ServiceError as e:
+            await message.answer(f"❌ {escape(str(e))}")
+            return
+        try:
+            await setup_bot_ui(bot, url)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось обновить кнопку меню")
+        await message.answer(
+            f"Готово, мини апп теперь открывается по адресу {escape(url)}.\n"
+            "Кнопка «Домашки» в меню уже обновлена. Кнопки в старых сообщениях ведут на старый адрес: "
+            "нажми /start, чтобы получить новую.",
+            reply_markup=webapp_kb(),
+        )
 
     @router.message(Command("score"))
     async def score_cmd(message: Message, command: CommandObject):
