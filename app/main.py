@@ -8,6 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
+from pydantic import ValidationError
 
 from app.bot import build_bot, build_dispatcher, make_notifier, setup_bot_ui
 from app.config import get_settings
@@ -20,7 +21,11 @@ log = logging.getLogger("app")
 
 
 def create_app():
-    settings = get_settings()
+    try:
+        settings = get_settings()
+    except ValidationError as e:
+        problems = "\n".join(f"  {'.'.join(map(str, err['loc'])).upper()}: {err['msg'].removeprefix('Value error, ')}" for err in e.errors())
+        raise SystemExit(f"Ошибка в настройках (.env):\n{problems}") from None
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     engine = make_engine(settings.db_url)
     sm = make_sessionmaker(engine)

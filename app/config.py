@@ -61,7 +61,18 @@ class Settings(BaseSettings):
     @classmethod
     def _split_ids(cls, v):
         if isinstance(v, str):
-            return [int(x) for x in v.replace(";", ",").split(",") if x.strip()]
+            ids = []
+            for x in v.replace(";", ",").split(","):
+                x = x.strip()
+                if not x:
+                    continue
+                if not x.lstrip("-").isdigit():
+                    raise ValueError(
+                        f"«{x}» не похоже на Telegram ID. Нужны числа через запятую, "
+                        "а не username. Свой ID можно узнать у @userinfobot."
+                    )
+                ids.append(int(x))
+            return ids
         return v
 
     @field_validator("task_markers", mode="before")
