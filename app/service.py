@@ -96,6 +96,7 @@ class HomeworkService:
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._prepared: dict[int, PreparedAssignment] = {}
+        self._rechecks: set[int] = set()  # перепроверки по запросу организатора
         self.files_dir = settings.data_dir / "files"
         self.files_dir.mkdir(parents=True, exist_ok=True)
 
@@ -356,6 +357,7 @@ class HomeworkService:
             sub.error = None
             sub.edited_at = None
             await s.commit()
+        self._rechecks.add(submission_id)
         await self._queue.put(submission_id)
         return sub
 
@@ -513,11 +515,14 @@ class HomeworkService:
                 sub.status = "error"
                 sub.error = str(e)[:2000]
                 await s.commit()
-            await self._notify(
-                sub.user_id,
-                [f"⚠️ Не получилось автоматически проверить работу по «{escape(a.title)}». "
-                 "Попытка не засчитана, организаторы уже в курсе."],
-            )
+            # Об ошибке участнику сообщаем один раз, а не после каждой перепроверки организатором
+            if submission_id not in self._rechecks:
+                await self._notify(
+                    sub.user_id,
+                    [f"⚠️ Не получилось автоматически проверить работу по «{escape(a.title)}». "
+                     "Попытка не засчитана, организаторы уже в курсе."],
+                )
+            self._rechecks.discard(submission_id)
             for admin in self.settings.admin_ids:
                 await self._notify(admin, [f"⚠️ Ошибка проверки сдачи #{submission_id} ({escape(a.title)}): {escape(str(e)[:500])}\n"
                                            f"Перепроверить: /recheck {submission_id}"])
@@ -532,8 +537,9 @@ class HomeworkService:
             sub.result = result.to_dict()
             sub.checked_at = utcnow()
             await s.commit()
+        self._rechecks.discard(submission_id)
         attempt = await self.attempt_number(sub)
-        await self._notify(sub.user_id, feedback_messages(a.title, attempt, result))
+        await self._notify(sub.user_id, feedback_messages(a.title, attempt, result, sub.organizer_comment))
 
     async def _notify(self, tg_id: int, messages: list[str]) -> None:
         if self.notifier is None:

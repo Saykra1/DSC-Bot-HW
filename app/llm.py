@@ -23,6 +23,9 @@ class LLMError(RuntimeError):
 
 
 class LLMClient:
+    """LLM_MODEL может содержать несколько моделей через запятую: если первая недоступна
+    (убрали из бесплатных, кончился лимит, ошибка сервера), берётся следующая."""
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self._client = AsyncOpenAI(
@@ -31,7 +34,9 @@ class LLMClient:
             timeout=settings.llm_timeout,
             max_retries=settings.llm_max_retries,
         )
-        self._json_mode = settings.llm_json_mode
+        self.models = [m.strip() for m in settings.llm_model.split(",") if m.strip()]
+        self._json_mode = {m: settings.llm_json_mode for m in self.models}
+        self.last_model: str | None = None
 
     async def complete_json(self, system: str, user: str) -> dict:
         """Просит модель ответить JSON-объектом. Одна повторная попытка при невалидном JSON."""
@@ -51,17 +56,34 @@ class LLMClient:
         raise LLMError(f"Модель не вернула валидный JSON: {last_text[:300]}")
 
     async def _chat(self, messages: list[dict]) -> str:
-        kwargs = dict(model=self.settings.llm_model, messages=messages, temperature=self.settings.llm_temperature)
-        if self._json_mode:
+        # Начинаем с модели, которая сработала в прошлый раз
+        order = sorted(self.models, key=lambda m: m != self.last_model)
+        errors = []
+        for model in order:
+            try:
+                text = await self._chat_one(model, messages)
+            except LLMError as e:
+                log.warning("Модель %s не ответила: %s", model, e)
+                errors.append(f"{model}: {e}")
+                continue
+            if model != self.last_model:
+                log.info("Проверяет модель %s", model)
+            self.last_model = model
+            return text
+        raise LLMError("Ни одна модель не ответила. " + " | ".join(errors))
+
+    async def _chat_one(self, model: str, messages: list[dict]) -> str:
+        kwargs = dict(model=model, messages=messages, temperature=self.settings.llm_temperature)
+        if self._json_mode.get(model):
             kwargs["response_format"] = {"type": "json_object"}
         try:
             resp = await self._client.chat.completions.create(**kwargs)
         except openai.BadRequestError as e:
             # Не все модели умеют response_format: пробуем без него и запоминаем.
             msg = str(e).lower()
-            if self._json_mode and ("response_format" in msg or "json" in msg):
-                log.warning("Модель не поддерживает response_format, выключаю JSON-режим: %s", e)
-                self._json_mode = False
+            if self._json_mode.get(model) and ("response_format" in msg or "json" in msg):
+                log.warning("Модель %s не поддерживает response_format, выключаю JSON-режим", model)
+                self._json_mode[model] = False
                 kwargs.pop("response_format", None)
                 try:
                     resp = await self._client.chat.completions.create(**kwargs)

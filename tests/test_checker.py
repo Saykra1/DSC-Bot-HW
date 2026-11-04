@@ -137,3 +137,39 @@ def test_parse_json_object_variants():
     assert parse_json_object('<think>hmm {"no": 1</think>\n{"a": 3}') == {"a": 3}
     with pytest.raises(ValueError):
         parse_json_object("no json here")
+
+
+class _FakeCompletions:
+    def __init__(self, behaviour):
+        self.behaviour = behaviour  # model -> Exception | str
+        self.calls = []
+
+    async def create(self, **kw):
+        import httpx
+        import openai
+        from types import SimpleNamespace
+        self.calls.append(kw["model"])
+        b = self.behaviour[kw["model"]]
+        if b == "404":
+            req = httpx.Request("POST", "https://x/chat/completions")
+            raise openai.NotFoundError("This model is unavailable for free", response=httpx.Response(404, request=req), body=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=b))])
+
+
+async def test_llm_falls_back_to_next_model():
+    from types import SimpleNamespace
+    from app.config import Settings
+    from app.llm import LLMClient, LLMError
+
+    llm = LLMClient(Settings(_env_file=None, llm_model="gone:free, ok:free", llm_api_key="k", llm_max_retries=0))
+    fake = _FakeCompletions({"gone:free": "404", "ok:free": '{"tasks": []}'})
+    llm._client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
+    assert await llm.complete_json("s", "u") == {"tasks": []}
+    assert fake.calls == ["gone:free", "ok:free"]
+    # дальше сразу идём в рабочую модель
+    await llm.complete_json("s", "u")
+    assert fake.calls[-1] == "ok:free" and len(fake.calls) == 3
+
+    fake.behaviour["ok:free"] = "404"
+    with pytest.raises(LLMError, match="Ни одна модель"):
+        await llm.complete_json("s", "u")

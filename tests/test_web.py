@@ -180,6 +180,12 @@ def test_llm_failure_marks_error_and_does_not_burn_attempt(ctx):
     assert client.get("/api/assignments", headers=hdr(STUDENT)).json()[0]["attempts_used"] == 0
     assert any(tg == ADMIN for tg, _ in sent)
 
+    # перепроверка, которая снова упала, не дёргает участника повторно
+    student_msgs = sum(1 for tg, _ in sent if tg == STUDENT)
+    client.post(f"/api/admin/submissions/{res['id']}/recheck", headers=hdr(ADMIN))
+    assert wait_done(client, res["id"], STUDENT)["status"] == "error"
+    assert sum(1 for tg, _ in sent if tg == STUDENT) == student_msgs
+
     service.llm = FakeLLM()
     client.post(f"/api/admin/submissions/{res['id']}/recheck", headers=hdr(ADMIN))
     assert wait_done(client, res["id"], STUDENT)["status"] == "done"
