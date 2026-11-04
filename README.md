@@ -32,7 +32,7 @@ Telegram-бот и мини апп для «Месяца бота» DSC Lab: у�
 
 ## Запуск локально
 
-Нужен Python 3.11+.
+Нужен Python 3.11+ (на Windows пакет `tzdata` из requirements обязателен).
 
 ```bash
 git clone https://github.com/Saykra1/DSC-Bot-HW.git
@@ -85,7 +85,17 @@ cloudflared tunnel --url http://localhost:8080
 Он напечатает адрес вида `https://something.trycloudflare.com`. Впиши его в `WEBAPP_URL` в `.env` и перезапусти бота.
 Бот сам добавит кнопку «Домашки» в меню чата и кнопку «Открыть мини апп» в `/start`.
 
-Адрес такого туннеля меняется при каждом перезапуске cloudflared, тогда нужно обновить `WEBAPP_URL`.
+Если в выводе cloudflared есть `Allow outbound ... on port 7844`, значит сеть блокирует его порт.
+Тогда подойдёт туннель через обычные порты:
+
+```bash
+# localhost.run: ничего ставить не нужно, ssh есть в Windows 10+
+ssh -R 80:localhost:8080 nokey@localhost.run
+# или ngrok (нужна регистрация на ngrok.com)
+ngrok http 8080
+```
+
+Адрес такого туннеля меняется при каждом перезапуске, тогда нужно обновить `WEBAPP_URL`.
 Постоянный адрес даёт, например, бесплатный статический домен ngrok или именованный туннель Cloudflare.
 
 Всё, что умеет мини апп, доступно и командами бота, так что без туннеля тоже можно работать.
