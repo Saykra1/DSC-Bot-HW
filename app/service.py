@@ -13,7 +13,7 @@ from html import escape
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -28,8 +28,8 @@ from app.checker import (
     prepare_assignment,
 )
 from app.config import Settings
-from app.db import Assignment, Submission, User, utcnow
-from app.formatting import as_utc, feedback_messages
+from app.db import Assignment, GradeCacheEntry, Submission, User, utcnow
+from app.formatting import as_utc, feedback_messages, fmt_dt
 from app.notebook import NotebookError, load_notebook, match_tasks, strip_outputs
 
 log = logging.getLogger(__name__)
@@ -62,12 +62,57 @@ class AssignmentView:
             "is_active": a.is_active,
             "best_score": self.best_score,
             "max_score": self.max_score,
+            "publish_at": as_utc(a.publish_at).isoformat() if a.publish_at else None,
+            "published": is_published(a),
+            "reference_available": reference_available(a),
         }
+
+
+def is_published(a: Assignment) -> bool:
+    return a.publish_at is None or utcnow() >= as_utc(a.publish_at)
+
+
+def reference_available(a: Assignment) -> bool:
+    """Эталон открывается участникам после дедлайна."""
+    return a.deadline is not None and utcnow() > as_utc(a.deadline)
+
+
+class DbGradeCache:
+    """Кэш оценок решений по заданию в БД (см. checker.GradeCache)."""
+
+    def __init__(self, sm: async_sessionmaker, assignment_id: int):
+        self.sm = sm
+        self.assignment_id = assignment_id
+
+    async def get(self, task_number: int, key: str) -> dict | None:
+        async with self.sm() as s:
+            e = await s.scalar(
+                select(GradeCacheEntry).where(
+                    GradeCacheEntry.assignment_id == self.assignment_id,
+                    GradeCacheEntry.task_number == task_number,
+                    GradeCacheEntry.code_hash == key,
+                )
+            )
+            return dict(e.data) if e else None
+
+    async def put(self, task_number: int, key: str, data: dict) -> None:
+        async with self.sm() as s:
+            exists = await s.scalar(
+                select(GradeCacheEntry.id).where(
+                    GradeCacheEntry.assignment_id == self.assignment_id,
+                    GradeCacheEntry.task_number == task_number,
+                    GradeCacheEntry.code_hash == key,
+                )
+            )
+            if exists is None:
+                s.add(GradeCacheEntry(assignment_id=self.assignment_id, task_number=task_number, code_hash=key, data=data))
+                await s.commit()
 
 
 def submission_to_dict(s: Submission, include_user: bool = False) -> dict:
     d = {
         "id": s.id,
+        "attempt": getattr(s, "attempt", None),  # номер попытки участника по этому заданию (None — не засчитана)
         "assignment_id": s.assignment_id,
         "status": s.status,
         "score": s.score,
@@ -97,6 +142,10 @@ class HomeworkService:
         self._workers: list[asyncio.Task] = []
         self._prepared: dict[int, PreparedAssignment] = {}
         self._rechecks: set[int] = set()  # перепроверки по запросу организатора
+        # Периодические задачи: публикация отложенных заданий, анонсы хакатонов
+        self.periodic_hooks: list[Callable[[], Awaitable[None]]] = [self.announce_due]
+        self.scheduler_interval = 30
+        self._bg: set[asyncio.Task] = set()
         self.files_dir = settings.data_dir / "files"
         self.files_dir.mkdir(parents=True, exist_ok=True)
 
@@ -201,6 +250,7 @@ class HomeworkService:
         reference_raw: bytes,
         max_attempts: int | None = None,
         deadline: datetime | None = None,
+        publish_at: datetime | None = None,
     ) -> tuple[Assignment, list[str]]:
         title = (title or "").strip()
         if not title:
@@ -226,12 +276,80 @@ class HomeworkService:
                 task_count=len(prepared.tasks),
                 max_attempts=max_attempts or self.settings.default_max_attempts,
                 deadline=deadline,
+                publish_at=publish_at,
+                announced=False,
                 is_active=True,
             )
             s.add(a)
             await s.commit()
         self._prepared[a.id] = prepared
+        if publish_at is None:
+            self.spawn(self.announce_due())
         return a, prepared.warnings
+
+    async def update_assignment(
+        self,
+        assignment_id: int,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        max_attempts: int | None = None,
+        deadline: datetime | None | bool = False,  # False — не менять, None — убрать
+        publish_at: datetime | None | bool = False,
+        template_raw: bytes | None = None,
+        reference_raw: bytes | None = None,
+    ) -> tuple[Assignment, list[str]]:
+        """Правка задания организатором. Если меняются файлы, кэш оценок сбрасывается."""
+        warnings: list[str] = []
+        async with self.sm() as s:
+            a = await s.get(Assignment, assignment_id)
+            if a is None:
+                raise ServiceError("Задание не найдено")
+            if template_raw is not None or reference_raw is not None:
+                tpl = template_raw if template_raw is not None else Path(a.template_path).read_bytes()
+                ref = reference_raw if reference_raw is not None else Path(a.reference_path).read_bytes()
+                try:
+                    prepared = prepare_assignment(tpl, ref, self.settings.task_markers)
+                except NotebookError as e:
+                    raise ServiceError(str(e)) from e
+                if template_raw is not None:
+                    Path(a.template_path).write_bytes(strip_outputs(template_raw))
+                if reference_raw is not None:
+                    Path(a.reference_path).write_bytes(reference_raw)
+                a.task_count = len(prepared.tasks)
+                self._prepared[a.id] = prepared
+                warnings = prepared.warnings
+                await s.execute(delete(GradeCacheEntry).where(GradeCacheEntry.assignment_id == a.id))
+            if title is not None:
+                if not title.strip():
+                    raise ServiceError("Название не может быть пустым")
+                a.title = title.strip()[:200]
+            if description is not None:
+                a.description = description.strip()
+            if max_attempts is not None:
+                if max_attempts < 1:
+                    raise ServiceError("Лимит попыток должен быть не меньше 1")
+                a.max_attempts = max_attempts
+            if deadline is not False:
+                a.deadline = deadline
+            if publish_at is not False:
+                a.publish_at = publish_at
+            await s.commit()
+        self.spawn(self.announce_due())
+        return a, warnings
+
+    async def recheck_all(self, assignment_id: int) -> int:
+        """Перепроверить все проверенные сдачи задания (например, после исправления эталона)."""
+        async with self.sm() as s:
+            ids = list((await s.scalars(
+                select(Submission.id).where(Submission.assignment_id == assignment_id, Submission.status.in_(["done", "error"]))
+            )).all())
+        for sid in ids:
+            try:
+                await self.recheck(sid)
+            except ServiceError:
+                pass
+        return len(ids)
 
     async def set_active(self, assignment_id: int, active: bool) -> Assignment:
         async with self.sm() as s:
@@ -255,6 +373,8 @@ class HomeworkService:
             if not include_inactive:
                 q = q.where(Assignment.is_active.is_(True))
             assignments = list((await s.scalars(q)).all())
+            if not include_inactive:
+                assignments = [a for a in assignments if is_published(a)]
             stats = {}
             rows = await s.execute(
                 select(Submission.assignment_id, func.count(Submission.id), func.max(Submission.score))
@@ -268,9 +388,27 @@ class HomeworkService:
             for a in assignments
         ]
 
-    async def template_bytes(self, assignment_id: int) -> tuple[str, bytes]:
+    async def template_bytes(self, assignment_id: int, user_id: int | None = None) -> tuple[str, bytes]:
         a = await self.get_assignment(assignment_id)
+        if user_id is not None and not self.is_admin(user_id) and not is_published(a):
+            raise ServiceError("Задание ещё не опубликовано")
         return f"{_safe_name(a.title)}.ipynb", Path(a.template_path).read_bytes()
+
+    async def reference_bytes(self, assignment_id: int, user_id: int) -> tuple[str, bytes]:
+        a = await self.get_assignment(assignment_id)
+        if not self.is_admin(user_id) and not reference_available(a):
+            raise ServiceError("Эталон откроется после дедлайна")
+        return f"{_safe_name(a.title)}_эталон.ipynb", Path(a.reference_path).read_bytes()
+
+    async def reference_tasks(self, assignment_id: int, user_id: int) -> list[dict]:
+        a = await self.get_assignment(assignment_id)
+        if not self.is_admin(user_id) and not reference_available(a):
+            raise ServiceError("Эталон откроется после дедлайна")
+        prepared = await self._get_prepared(a)
+        return [
+            {"number": t.number, "title": t.title, "reference": prepared.reference_code.get(t.number, "")}
+            for t in prepared.tasks
+        ]
 
     async def _get_prepared(self, a: Assignment) -> PreparedAssignment:
         if a.id not in self._prepared:
@@ -297,6 +435,8 @@ class HomeworkService:
                 raise ServiceError("Задание не найдено")
             if not a.is_active:
                 raise ServiceError("Приём работ по этому заданию закрыт")
+            if not is_published(a) and not self.is_admin(user_id):
+                raise ServiceError("Задание ещё не опубликовано")
             if a.deadline and utcnow() > as_utc(a.deadline):
                 raise ServiceError("Дедлайн по этому заданию уже прошёл")
             used = await s.scalar(
@@ -329,6 +469,19 @@ class HomeworkService:
         await self._queue.put(sub.id)
         return sub
 
+    @staticmethod
+    def _number_attempts(subs: list[Submission]) -> list[Submission]:
+        """Проставляет sub.attempt: номер попытки участника по заданию (ошибки проверки не считаются)."""
+        counters: dict[tuple[int, int], int] = {}
+        for sub in sorted(subs, key=lambda x: x.id):
+            key = (sub.user_id, sub.assignment_id)
+            if sub.status == "error":
+                sub.attempt = None
+                continue
+            counters[key] = counters.get(key, 0) + 1
+            sub.attempt = counters[key]
+        return subs
+
     async def attempt_number(self, submission: Submission) -> int:
         async with self.sm() as s:
             return await s.scalar(
@@ -349,7 +502,8 @@ class HomeworkService:
             )
             if sub is None:
                 raise ServiceError("Сдача не найдена")
-            return sub
+        sub.attempt = None if sub.status == "error" else await self.attempt_number(sub)
+        return sub
 
     async def list_user_submissions(self, user_id: int, assignment_id: int | None = None) -> list[Submission]:
         async with self.sm() as s:
@@ -357,7 +511,7 @@ class HomeworkService:
             if assignment_id is not None:
                 q = q.where(Submission.assignment_id == assignment_id)
             q = q.options(selectinload(Submission.assignment))
-            return list((await s.scalars(q)).all())
+            return self._number_attempts(list((await s.scalars(q)).all()))
 
     async def list_assignment_submissions(self, assignment_id: int) -> list[Submission]:
         async with self.sm() as s:
@@ -367,7 +521,7 @@ class HomeworkService:
                 .order_by(Submission.id.desc())
                 .options(selectinload(Submission.user))
             )
-            return list((await s.scalars(q)).all())
+            return self._number_attempts(list((await s.scalars(q)).all()))
 
     async def recheck(self, submission_id: int) -> Submission:
         async with self.sm() as s:
@@ -448,9 +602,10 @@ class HomeworkService:
             await self._notify(sub.user_id, ["\n".join(lines)])
         return sub
 
-    async def submission_code(self, submission_id: int) -> dict:
+    async def submission_code(self, submission_id: int, include_reference: bool = True) -> dict:
         """Код участника: по заданиям (как его увидел агент) и все кодовые ячейки ноутбука."""
         sub = await self.get_submission(submission_id)
+        include_reference = include_reference or reference_available(sub.assignment)
         raw = Path(sub.file_path).read_bytes()
         cells = load_notebook(raw)
         prepared = await self._get_prepared(sub.assignment)
@@ -458,7 +613,7 @@ class HomeworkService:
         return {
             "tasks": [
                 {"number": m.task.number, "title": m.task.title, "code": m.code,
-                 "reference": prepared.reference_code.get(m.task.number, "")}
+                 "reference": prepared.reference_code.get(m.task.number, "") if include_reference else None}
                 for m in matches
             ],
             "cells": [{"index": c.index, "type": c.cell_type, "source": c.source} for c in cells if c.source.strip()],
@@ -488,6 +643,52 @@ class HomeworkService:
                         sub.score, sub.max_score, attempts[uid], *task_scores])
         return buf.getvalue()
 
+    # ---------- рассылки и планировщик ----------
+
+    def spawn(self, coro) -> None:
+        """Запускает задачу в фоне (рассылки не должны задерживать ответ организатору)."""
+        task = asyncio.create_task(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def broadcast(self, text: str) -> int:
+        """Сообщение всем участникам (кроме организаторов). Возвращает число адресатов."""
+        async with self.sm() as s:
+            ids = list((await s.scalars(select(User.tg_id))).all())
+        ids = [i for i in ids if not self.is_admin(i)]
+        for tg_id in ids:
+            await self._notify(tg_id, [text])
+            await asyncio.sleep(0.05)  # не упираемся в лимиты Telegram
+        return len(ids)
+
+    async def announce_due(self) -> None:
+        """Рассылает уведомления о заданиях, которые только что стали доступны."""
+        async with self.sm() as s:
+            pending = list((await s.scalars(
+                select(Assignment).where(Assignment.announced.is_(False), Assignment.is_active.is_(True))
+            )).all())
+            due = [a for a in pending if is_published(a)]
+            for a in due:
+                a.announced = True
+            await s.commit()
+        for a in due:
+            text = f"📚 Новое задание: <b>{escape(a.title)}</b>"
+            if a.description:
+                text += f"\n{escape(a.description)}"
+            if a.deadline:
+                text += f"\nДедлайн: {fmt_dt(a.deadline, self.settings.tz)} (МСК)"
+            text += "\n\nОткрой /tasks, чтобы скачать шаблон."
+            await self.broadcast(text)
+
+    async def _scheduler(self) -> None:
+        while True:
+            for hook in self.periodic_hooks:
+                try:
+                    await hook()
+                except Exception:  # noqa: BLE001
+                    log.exception("Ошибка в планировщике")
+            await asyncio.sleep(self.scheduler_interval)
+
     # ---------- очередь проверки ----------
 
     async def start(self) -> None:
@@ -499,6 +700,7 @@ class HomeworkService:
             await self._queue.put(sid)
         for _ in range(max(1, self.settings.check_concurrency)):
             self._workers.append(asyncio.create_task(self._worker()))
+        self._workers.append(asyncio.create_task(self._scheduler()))
 
     async def stop(self) -> None:
         for w in self._workers:
@@ -530,7 +732,9 @@ class HomeworkService:
 
         try:
             prepared = await self._get_prepared(a)
-            result: CheckResult = await check_submission(prepared, Path(sub.file_path).read_bytes(), self.llm, a.title)
+            result: CheckResult = await check_submission(
+                prepared, Path(sub.file_path).read_bytes(), self.llm, a.title, cache=DbGradeCache(self.sm, a.id)
+            )
         except Exception as e:  # noqa: BLE001
             log.exception("Проверка сдачи %s не удалась", submission_id)
             async with self.sm() as s:

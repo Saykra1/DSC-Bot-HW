@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     llm_model: str = ""
     # Просить у модели ответ в режиме JSON (response_format). Если модель не умеет, выключите.
     llm_json_mode: bool = True
-    llm_temperature: float = 0.2
+    llm_temperature: float = 0.0
     llm_timeout: float = 180.0
     llm_max_retries: int = 4
     # Сколько проверок идёт параллельно (у бесплатных моделей жёсткие лимиты)

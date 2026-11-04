@@ -4,13 +4,49 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, inspect, text
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    inspect,
+    text,
+)
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class UTCDateTime(TypeDecorator):
+    """Дата-время, которое всегда хранится в UTC и читается с часовым поясом.
+
+    SQLite не хранит пояс: без этого 23:59 по МСК сохранялось бы как 23:59 UTC.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -25,7 +61,7 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(256), default="")  # имя из профиля Telegram
     nickname: Mapped[str | None] = mapped_column(String(64))  # ник внутри бота (задаёт участник)
     fio: Mapped[str | None] = mapped_column(String(256))  # ФИО для организаторов
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     @property
     def display_name(self) -> str:
@@ -64,9 +100,13 @@ class Assignment(Base):
     reference_path: Mapped[str] = mapped_column(String(500))
     task_count: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
-    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime | None] = mapped_column(UTCDateTime)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Когда задание появится у участников (None — сразу). Время хранится в UTC.
+    publish_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # Разослано ли уведомление о новом задании. NULL у старых записей = уже не рассылать.
+    announced: Mapped[bool | None] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     submissions: Mapped[list["Submission"]] = relationship(back_populates="assignment")
 
@@ -86,13 +126,64 @@ class Submission(Base):
     result: Mapped[dict | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
     auto_score: Mapped[int | None] = mapped_column(Integer)  # оценка агента до правок организатора
-    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # когда организатор менял баллы
+    edited_at: Mapped[datetime | None] = mapped_column(UTCDateTime)  # когда организатор менял баллы
     organizer_comment: Mapped[str | None] = mapped_column(Text)
-    comment_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    comment_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     assignment: Mapped[Assignment] = relationship(back_populates="submissions")
+    user: Mapped[User] = relationship()
+
+
+class GradeCacheEntry(Base):
+    """Оценка уже проверенного решения задания — чтобы одинаковый код получал одинаковую оценку."""
+
+    __tablename__ = "grade_cache"
+    __table_args__ = (UniqueConstraint("assignment_id", "task_number", "code_hash"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), index=True)
+    task_number: Mapped[int] = mapped_column(Integer)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    data: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class Hackathon(Base):
+    __tablename__ = "hackathons"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")  # условие (текст или содержимое .md)
+    starts_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    ends_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    metric: Mapped[str] = mapped_column(String(32))
+    id_column: Mapped[str] = mapped_column(String(100))
+    target_column: Mapped[str] = mapped_column(String(100))
+    daily_limit: Mapped[int] = mapped_column(Integer, default=5)
+    folder: Mapped[str] = mapped_column(String(500))  # папка с train/test/baseline/solution
+    # Имена файлов для участников: {"train": "train.csv", "test": "test.csv", "baseline": "baseline.ipynb"}
+    files: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    announced: Mapped[bool | None] = mapped_column(Boolean)
+    start_notified: Mapped[bool | None] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class HackathonSubmission(Base):
+    __tablename__ = "hackathon_submissions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hackathon_id: Mapped[int] = mapped_column(ForeignKey("hackathons.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.tg_id"), index=True)
+    file_path: Mapped[str] = mapped_column(String(500))
+    file_name: Mapped[str] = mapped_column(String(256), default="")
+    status: Mapped[str] = mapped_column(String(16), default="done")  # done | error
+    score: Mapped[float | None] = mapped_column(Float)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
     user: Mapped[User] = relationship()
 
 

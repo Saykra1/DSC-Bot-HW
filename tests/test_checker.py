@@ -37,7 +37,9 @@ class FakeLLM:
         # По умолчанию ставим 8 каждому заданию из запроса
         import re
         nums = [int(n) for n in re.findall(r"=== Задание (\d+):", user)]
-        return {"tasks": [{"number": n, "score": 8, "verdict": "correct", "feedback": "ok", "improvements": ["a"]} for n in nums],
+        # Два мелких замечания = 8 баллов
+        minor = [{"severity": "minor", "text": "a"}, {"severity": "minor", "text": "b"}]
+        return {"tasks": [{"number": n, "issues": minor, "feedback": "ok", "improvements": ["a"]} for n in nums],
                 "summary": "Хорошая работа"}
 
 

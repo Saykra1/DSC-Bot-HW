@@ -58,7 +58,7 @@ async def env(tmp_path: Path):
     dp = build_dispatcher(service, webapp_url="https://example.com")
     counter = {"n": 0}
 
-    async def send(user_id: int, text: str | None = None, doc: str | None = None):
+    async def send(user_id: int, text: str | None = None, doc: str | None = None, ext: str = ".ipynb"):
         counter["n"] += 1
         msg = {
             "message_id": counter["n"], "date": int(datetime.now().timestamp()),
@@ -70,7 +70,7 @@ async def env(tmp_path: Path):
             if text.startswith("/"):
                 msg["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
         if doc is not None:
-            msg["document"] = {"file_id": doc, "file_unique_id": doc, "file_name": f"{doc}.ipynb"}
+            msg["document"] = {"file_id": doc, "file_unique_id": doc, "file_name": f"{doc}{ext}"}
         await dp.feed_update(bot, Update.model_validate({"update_id": counter["n"], "message": msg}, context={"bot": bot}))
 
     async def press(user_id: int, data: str):
@@ -174,3 +174,54 @@ async def test_admin_changes_webapp_url(env):
     await send(STUDENT, "/start")
     kb = session.requests[-1].reply_markup
     assert kb.inline_keyboard[0][0].web_app.url == "https://new.pinggy.link"
+
+
+async def test_scheduled_assignment_via_bot(env):
+    service, session, send, press = env
+    await send(STUDENT, "/start")
+    await send(ADMIN, "/new")
+    await send(ADMIN, "Позже")
+    await send(ADMIN, "-")
+    await send(ADMIN, doc="tpl")
+    await send(ADMIN, doc="ref")
+    await send(ADMIN, "2 2099-01-01 12:00 2098-12-01 10:00")
+    assert "01.12.2098 10:00" in session.texts()[-1]
+    assert await service.list_assignments(STUDENT) == []
+    await service.announce_due()
+    assert not any(isinstance(r, SendMessage) and r.chat_id == STUDENT and "Новое задание" in r.text
+                   for r in session.requests)
+
+
+async def test_hackathon_in_bot(env):
+    from datetime import timedelta
+
+    from app.hackathons import UploadedFile, hackathons_for
+
+    service, session, send, press = env
+    await send(STUDENT, "/hackathon")
+    assert "пока нет" in session.texts()[-1]
+
+    hacks = hackathons_for(service)
+    now = datetime.now(timezone.utc)
+    h = await hacks.create(
+        title="Пульс", description="Предскажите target", starts_at=now - timedelta(minutes=1),
+        ends_at=now + timedelta(hours=1), metric="accuracy", id_column="id", target_column="target", daily_limit=3,
+        train=UploadedFile("train.csv", b"id,target\n1,0\n"), test=UploadedFile("test.csv", b"id\n10\n11\n"),
+        solution=UploadedFile("s.csv", b"id,target\n10,0\n11,1\n"),
+    )
+    await send(STUDENT, "/hackathon")
+    assert "Пульс" in session.texts()[-1] and "Идёт" in session.texts()[-1]
+
+    session.files["pred"] = b"id,target\n10,0\n11,0\n"
+    await send(STUDENT, doc="pred", ext=".csv")
+    assert "Решение №1" in session.texts()[-1] and "0.5" in session.texts()[-1] and "1 из 1" in session.texts()[-1]
+    session.files["bad"] = b"id,target\n10,0\n"
+    await send(STUDENT, doc="bad", ext=".csv")
+    assert "не принято" in session.texts()[-1]
+
+    await press(STUDENT, f"hlb:{h.id}")
+    assert "Лидерборд" in session.texts()[-1] and "← ты" in session.texts()[-1]
+    await press(STUDENT, f"hmy:{h.id}")
+    assert "№2" in session.texts()[-1] and "№1" in session.texts()[-1]
+    await press(STUDENT, f"hf:{h.id}:solution")
+    assert not any(isinstance(r, SendDocument) for r in session.requests[-1:])

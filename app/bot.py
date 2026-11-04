@@ -28,7 +28,8 @@ from aiogram.types import (
 
 from app.checker import CheckResult
 from app.formatting import feedback_messages, fmt_dt
-from app.service import HomeworkService, ServiceError
+from app.hackathons import hackathons_for
+from app.service import HomeworkService, ServiceError, is_published, reference_available
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ async def setup_bot_ui(bot: Bot, webapp_url: str) -> None:
         [
             BotCommand(command="tasks", description="Домашние задания"),
             BotCommand(command="my", description="Мои сдачи и отзывы"),
+            BotCommand(command="hackathon", description="Хакатон: условие, данные, лидерборд"),
             BotCommand(command="profile", description="Профиль: ник и ФИО"),
             BotCommand(command="help", description="Как сдавать домашки"),
         ]
@@ -79,6 +81,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
     router = Router()
     dp.include_router(router)
     tz = service.settings.tz
+    hacks = hackathons_for(service)
 
     async def touch(user: TgUser) -> None:
         await service.upsert_user(user.id, user.username, user.full_name)
@@ -106,7 +109,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             "2. Допиши код в ячейках с заданиями.\n"
             "3. Нажми «Сдать работу» и пришли .ipynb файлом.\n"
             "4. Через пару минут придёт оценка и отзыв по коду.\n\n"
-            "/my — твои сдачи и отзывы.\n/profile — ник и ФИО."
+            "/my — твои сдачи и отзывы.\n/hackathon — хакатоны.\n/profile — ник и ФИО."
         )
         user = await service.get_user(message.from_user.id)
         if not user.fio and not service.is_admin(message.from_user.id):
@@ -163,7 +166,10 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         await message.answer(
             "Как сдавать: /tasks → задание → «Сдать работу» → отправь .ipynb файлом.\n"
             "Можно просто прислать .ipynb, я спрошу, к какому заданию его отнести.\n"
-            "Число попыток ограничено, засчитывается лучшая.\n/cancel — отменить текущее действие."
+            "Число попыток ограничено, засчитывается лучшая.\n"
+            "После дедлайна в карточке задания появится эталонное решение.\n\n"
+            "Хакатон: /hackathon — условие и данные. Решение — .csv файлом прямо в чат.\n"
+            "/cancel — отменить текущее действие."
         )
 
     @router.message(Command("cancel"))
@@ -207,16 +213,22 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         lines.append(f"Заданий в ноутбуке: {a.task_count}")
         lines.append(f"Попытки: {view.attempts_used} из {a.max_attempts}")
         if a.deadline:
-            lines.append(f"Дедлайн: {fmt_dt(a.deadline, tz)}")
+            lines.append(f"Дедлайн: {fmt_dt(a.deadline, tz)} (МСК)")
+        if not is_published(a):
+            lines.append(f"🕒 Участники увидят задание {fmt_dt(a.publish_at, tz)} (МСК)")
         if view.best_score is not None:
             lines.append(f"Лучший результат: {view.best_score}/{view.max_score}")
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="📥 Скачать шаблон", callback_data=f"tpl:{aid}")],
-                [InlineKeyboardButton(text="📤 Сдать работу", callback_data=f"sub:{aid}")],
-                [InlineKeyboardButton(text="🗂 Мои попытки", callback_data=f"my:{aid}")],
-            ]
-        )
+        rows = [
+            [InlineKeyboardButton(text="📥 Скачать шаблон", callback_data=f"tpl:{aid}")],
+            [InlineKeyboardButton(text="📤 Сдать работу", callback_data=f"sub:{aid}")],
+            [InlineKeyboardButton(text="🗂 Мои попытки", callback_data=f"my:{aid}")],
+        ]
+        if reference_available(a):
+            lines.append("Дедлайн прошёл: можно сравнить своё решение с эталоном.")
+            rows.append([InlineKeyboardButton(text="📗 Эталонное решение", callback_data=f"ref:{aid}")])
+        elif a.deadline:
+            lines.append("Эталон откроется после дедлайна.")
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
         await cb.message.answer("\n".join(lines), reply_markup=kb)
         await cb.answer()
 
@@ -224,11 +236,25 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
     async def send_template(cb: CallbackQuery):
         aid = int(cb.data.split(":")[1])
         try:
-            name, raw = await service.template_bytes(aid)
+            name, raw = await service.template_bytes(aid, cb.from_user.id)
         except ServiceError as e:
             await cb.answer(str(e), show_alert=True)
             return
         await cb.message.answer_document(BufferedInputFile(raw, filename=name), caption="Шаблон задания")
+        await cb.answer()
+
+    @router.callback_query(F.data.startswith("ref:"))
+    async def send_reference(cb: CallbackQuery):
+        aid = int(cb.data.split(":")[1])
+        try:
+            name, raw = await service.reference_bytes(aid, cb.from_user.id)
+        except ServiceError as e:
+            await cb.answer(str(e), show_alert=True)
+            return
+        await cb.message.answer_document(
+            BufferedInputFile(raw, filename=name),
+            caption="Эталонное решение. Сравнить по заданиям со своим кодом удобнее в мини аппе: Мои сдачи → попытка.",
+        )
         await cb.answer()
 
     @router.callback_query(F.data.startswith("sub:"))
@@ -245,7 +271,8 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         except ServiceError as e:
             await message.answer(f"❌ {escape(str(e))}")
             return
-        await message.answer(f"Принято! Работа #{sub.id} в очереди на проверку, отзыв придёт сюда.")
+        attempt = await service.attempt_number(sub)
+        await message.answer(f"Принято! Попытка {attempt} в очереди на проверку, отзыв придёт сюда.")
 
     @router.message(SubmitFlow.waiting_file, F.document)
     async def got_file(message: Message, state: FSMContext, bot: Bot):
@@ -296,23 +323,29 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         await state.update_data(reference_file_id=message.document.file_id)
         await state.set_state(NewAssignment.settings)
         await message.answer(
-            f"Лимит попыток и дедлайн (время {escape(service.settings.timezone)}), например:\n"
-            "<code>3 2026-11-20 23:59</code>\n"
+            "Лимит попыток, дедлайн и (необязательно) время публикации, всё по МСК. Например:\n"
+            "<code>3 2026-11-20 23:59</code> — открыть сразу\n"
+            "<code>3 2026-11-20 23:59 2026-11-10 10:00</code> — участники увидят задание 10.11 в 10:00 "
+            "и получат уведомление\n"
             f"Только лимит: <code>3</code>. По умолчанию ({service.settings.default_max_attempts} попытки, без дедлайна): <code>-</code>"
         )
 
     @router.message(NewAssignment.settings, NOT_COMMAND)
     async def new_settings(message: Message, state: FSMContext, bot: Bot):
         text = message.text.strip()
-        max_attempts, deadline = None, None
+        max_attempts, deadline, publish_at = None, None, None
         if text != "-":
-            parts = text.split(maxsplit=1)
+            parts = text.split()
             try:
+                if len(parts) not in (1, 3, 5):
+                    raise ValueError
                 max_attempts = int(parts[0])
                 if max_attempts < 1:
                     raise ValueError
-                if len(parts) > 1:
-                    deadline = datetime.strptime(parts[1].strip(), "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+                if len(parts) >= 3:
+                    deadline = datetime.strptime(" ".join(parts[1:3]), "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+                if len(parts) == 5:
+                    publish_at = datetime.strptime(" ".join(parts[3:5]), "%Y-%m-%d %H:%M").replace(tzinfo=tz)
             except ValueError:
                 await message.answer("Не понял формат. Пример: <code>3 2026-11-20 23:59</code> или <code>-</code>")
                 return
@@ -321,7 +354,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         ref = (await bot.download(data["reference_file_id"])).read()
         try:
             a, warnings = await service.create_assignment(
-                data["title"], data.get("description", ""), tpl, ref, max_attempts, deadline
+                data["title"], data.get("description", ""), tpl, ref, max_attempts, deadline, publish_at
             )
         except ServiceError as e:
             await state.clear()
@@ -329,7 +362,12 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             return
         await state.clear()
         prepared = await service._get_prepared(a)
-        lines = [f"✅ Задание #{a.id} «{escape(a.title)}» создано и открыто для сдачи.", "", "Найденные задания:"]
+        if publish_at:
+            head = (f"✅ Задание «{escape(a.title)}» создано (id {a.id}). Участники увидят его "
+                    f"{fmt_dt(publish_at, tz)} (МСК) и получат уведомление.")
+        else:
+            head = f"✅ Задание «{escape(a.title)}» создано (id {a.id}) и открыто для сдачи. Участникам ушло уведомление."
+        lines = [head, "", "Найденные задания:"]
         for t in prepared.tasks:
             lines.append(f"{t.number}. {escape(t.title)}")
         if warnings:
@@ -346,11 +384,14 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
     # ---------- документ без контекста ----------
 
     @router.message(F.document)
-    async def loose_document(message: Message, state: FSMContext):
+    async def loose_document(message: Message, state: FSMContext, bot: Bot):
         await touch(message.from_user)
         name = message.document.file_name or ""
+        if name.lower().endswith(".csv"):
+            await hackathon_csv(message, bot)
+            return
         if not name.lower().endswith(".ipynb"):
-            await message.answer("Я принимаю только .ipynb файлы.")
+            await message.answer("Я принимаю .ipynb (домашки) и .csv (решения хакатона).")
             return
         views = await service.list_assignments(message.from_user.id)
         if not views:
@@ -385,9 +426,11 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         rows, lines = [], []
         for s in subs[:15]:
             score = f"{s.score}/{s.max_score}" if s.status == "done" else STATUS_TEXT.get(s.status, s.status)
-            lines.append(f"#{s.id} · {escape(s.assignment.title)} · {fmt_dt(s.created_at, tz)} · {score}")
+            attempt = f"попытка {s.attempt}" if s.attempt else "не засчитана"
+            lines.append(f"{escape(s.assignment.title)} · {attempt} · {fmt_dt(s.created_at, tz)} · {score}")
             if s.status == "done":
-                rows.append([InlineKeyboardButton(text=f"Отзыв #{s.id}", callback_data=f"res:{s.id}")])
+                rows.append([InlineKeyboardButton(text=f"Отзыв: {s.assignment.title[:40]} · попытка {s.attempt}",
+                                                  callback_data=f"res:{s.id}")])
         await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
 
     @router.message(Command("my"))
@@ -410,16 +453,18 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             await message.answer("Это не твоя сдача.")
             return
         if admin_view:
-            await message.answer(f"Участник: {escape(sub.user.admin_label)} (id {sub.user_id})")
+            await message.answer(
+                f"Сдача id {sub.id} · попытка {sub.attempt or '— (ошибка проверки)'}\n"
+                f"Участник: {escape(sub.user.admin_label)} (tg id {sub.user_id})"
+            )
         if sub.status != "done":
             text = f"Статус: {STATUS_TEXT.get(sub.status, sub.status)}"
             if sub.error and admin_view:
                 text += f"\n{escape(sub.error[:1000])}"
             await message.answer(text)
         else:
-            attempt = await service.attempt_number(sub)
             for text in feedback_messages(
-                sub.assignment.title, attempt, CheckResult.from_dict(sub.result), sub.organizer_comment
+                sub.assignment.title, sub.attempt, CheckResult.from_dict(sub.result), sub.organizer_comment
             ):
                 await message.answer(text)
             if admin_view and sub.result and sub.result.get("warnings"):
@@ -429,6 +474,120 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
     async def result_cb(cb: CallbackQuery):
         await send_result(cb.message, cb.from_user.id, int(cb.data.split(":")[1]))
         await cb.answer()
+
+    # ---------- хакатоны ----------
+
+    def fmt_score(v: float | None) -> str:
+        return "—" if v is None else f"{v:.5g}"
+
+    async def current_hackathon(user_id: int) -> dict | None:
+        """Идущий хакатон, иначе ближайший предстоящий, иначе последний прошедший."""
+        items = await hacks.list_all(user_id)
+        items = [h for h in items if h["is_active"]]
+        for st in ("running", "upcoming"):
+            found = [h for h in items if h["status"] == st]
+            if found:
+                return found[0]
+        return items[-1] if items else None
+
+    @router.message(Command("hackathon"))
+    async def hackathon_cmd(message: Message):
+        await touch(message.from_user)
+        h = await current_hackathon(message.from_user.id)
+        if h is None:
+            await message.answer("Ближайших хакатонов пока нет. Как только организаторы его объявят, я напишу.")
+            return
+        start, end = fmt_dt(datetime.fromisoformat(h["starts_at"]), tz), fmt_dt(datetime.fromisoformat(h["ends_at"]), tz)
+        if h["status"] == "upcoming":
+            await message.answer(
+                f"🏆 Ближайший хакатон <b>{escape(h['title'])}</b> пройдёт с {start} по {end} (МСК).\n"
+                "Данные и условие появятся здесь в момент старта."
+            )
+            return
+        lines = [f"🏆 <b>{escape(h['title'])}</b>",
+                 f"{'Идёт' if h['status'] == 'running' else 'Завершён'}: с {start} по {end} (МСК)",
+                 f"Метрика: {escape(h['metric_title'])} ({'больше' if h['higher_is_better'] else 'меньше'} — лучше)"]
+        if h["description"]:
+            desc = h["description"]
+            lines += ["", escape(desc[:2500] + ("…" if len(desc) > 2500 else ""))]
+        if h["status"] == "running":
+            lines += ["", f"Формат ответа: CSV с колонками <code>{escape(h['id_column'])}</code> и "
+                          f"<code>{escape(h['target_column'])}</code>, строка на каждый id из test. "
+                          "Пришли файл .csv прямо в этот чат.",
+                      f"Сегодня использовано {h['used_today']} из {h['daily_limit']} попыток."]
+        if h["my_best"] is not None:
+            lines.append(f"Твой лучший результат: {fmt_score(h['my_best'])}")
+        names = {"train": "📊 train", "test": "🧪 test", "baseline": "🧩 baseline", "task": "📄 условие"}
+        btns = [InlineKeyboardButton(text=names[k], callback_data=f"hf:{h['id']}:{k}") for k in names if k in h["files"]]
+        rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        rows.append([InlineKeyboardButton(text="🏅 Лидерборд", callback_data=f"hlb:{h['id']}"),
+                     InlineKeyboardButton(text="🗂 Мои решения", callback_data=f"hmy:{h['id']}")])
+        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @router.callback_query(F.data.startswith("hf:"))
+    async def hackathon_file_cb(cb: CallbackQuery):
+        _, hid, kind = cb.data.split(":")
+        try:
+            name, raw = await hacks.file(int(hid), kind, cb.from_user.id)
+        except ServiceError as e:
+            await cb.answer(str(e), show_alert=True)
+            return
+        await cb.message.answer_document(BufferedInputFile(raw, filename=name))
+        await cb.answer()
+
+    @router.callback_query(F.data.startswith("hlb:"))
+    async def hackathon_lb_cb(cb: CallbackQuery):
+        hid = int(cb.data.split(":")[1])
+        table = await hacks.leaderboard(hid, cb.from_user.id)
+        if not table:
+            await cb.answer("Пока нет ни одного решения", show_alert=True)
+            return
+        lines = ["🏅 <b>Лидерборд</b> (место · участник · результат · попыток)"]
+        for r in table[:20]:
+            me = " ← ты" if r["is_me"] else ""
+            lines.append(f"{r['place']}. {escape(r['name'])} · {fmt_score(r['score'])} · {r['attempts']}{me}")
+        mine = next((r for r in table[20:] if r["is_me"]), None)
+        if mine:
+            lines.append(f"…\n{mine['place']}. {escape(mine['name'])} · {fmt_score(mine['score'])} · {mine['attempts']} ← ты")
+        await cb.message.answer("\n".join(lines))
+        await cb.answer()
+
+    @router.callback_query(F.data.startswith("hmy:"))
+    async def hackathon_my_cb(cb: CallbackQuery):
+        hid = int(cb.data.split(":")[1])
+        subs = await hacks.my_submissions(cb.from_user.id, hid)
+        if not subs:
+            await cb.answer("Решений пока нет", show_alert=True)
+            return
+        lines = ["🗂 <b>Мои решения</b>"]
+        for x in subs[:20]:
+            res = fmt_score(x["score"]) if x["status"] == "done" else "ошибка: " + escape((x["error"] or "")[:150])
+            lines.append(f"№{x['number']} · {fmt_dt(datetime.fromisoformat(x['created_at']), tz)} · {res}")
+        await cb.message.answer("\n".join(lines))
+        await cb.answer()
+
+    async def hackathon_csv(message: Message, bot: Bot) -> None:
+        h = await current_hackathon(message.from_user.id)
+        if h is None or h["status"] != "running":
+            await message.answer("Сейчас нет идущего хакатона, .csv принимать некуда. /hackathon — подробности.")
+            return
+        raw = (await bot.download(message.document)).read()
+        try:
+            sub = await hacks.submit(message.from_user.id, h["id"], raw, message.document.file_name or "")
+        except ServiceError as e:
+            await message.answer(f"❌ {escape(str(e))}")
+            return
+        mine = await hacks.my_submissions(message.from_user.id, h["id"])
+        number = next(x["number"] for x in mine if x["id"] == sub.id)
+        if sub.status == "error":
+            await message.answer(f"⚠️ Решение №{number} не принято (попытка не списана):\n{escape(sub.error or '')}")
+            return
+        table = await hacks.leaderboard(h["id"], message.from_user.id)
+        place = next((r["place"] for r in table if r["is_me"]), None)
+        await message.answer(
+            f"✅ Решение №{number}: {escape(h['metric_title'])} = <b>{fmt_score(sub.score)}</b>\n"
+            f"Твоё место в лидерборде: {place} из {len(table)}"
+        )
 
     # ---------- админка ----------
 
@@ -445,16 +604,19 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             "/score &lt;id&gt; &lt;задание&gt;=&lt;балл&gt; … — изменить баллы, например <code>/score 12 2=8 3=10</code>",
             "/comment &lt;id&gt; &lt;текст&gt; — комментарий участнику от организатора",
             "/webapp &lt;https://адрес&gt; — сменить адрес мини аппа (после перезапуска туннеля)",
-            "Удобнее всего всё это делать в мини аппе.",
+            "Править задания и создавать хакатоны — в мини аппе (вкладка «Организаторам»).",
             "",
         ]
         rows = []
         for v in views:
             a = v.assignment
-            lines.append(f"#{a.id} {escape(a.title)} — {'открыто' if a.is_active else 'закрыто'}")
+            state_txt = "открыто" if a.is_active else "закрыто"
+            if a.is_active and not is_published(a):
+                state_txt = f"появится {fmt_dt(a.publish_at, tz)} (МСК)"
+            lines.append(f"id {a.id} · {escape(a.title)} — {state_txt}")
             rows.append(
                 [
-                    InlineKeyboardButton(text=f"#{a.id} сдачи", callback_data=f"subs:{a.id}"),
+                    InlineKeyboardButton(text=f"id {a.id}: сдачи", callback_data=f"subs:{a.id}"),
                     InlineKeyboardButton(text="CSV", callback_data=f"csv:{a.id}"),
                     InlineKeyboardButton(text="Закрыть" if a.is_active else "Открыть", callback_data=f"tog:{a.id}"),
                 ]
@@ -492,10 +654,11 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         if not subs:
             await cb.answer("Сдач пока нет", show_alert=True)
             return
-        lines = [f"Сдачи по заданию #{aid} (последние 40):"]
+        lines = [f"Сдачи по заданию id {aid} (последние 40). /sub &lt;id&gt; — подробно:"]
         for s in subs[:40]:
             score = f"{s.score}/{s.max_score}" if s.status == "done" else STATUS_TEXT.get(s.status, s.status)
-            lines.append(f"/sub {s.id} · {escape(s.user.admin_label)} · {score}")
+            attempt = f"№{s.attempt}" if s.attempt else "№—"
+            lines.append(f"/sub {s.id} · {attempt} · {escape(s.user.admin_label)} · {score}")
         await cb.message.answer("\n".join(lines))
         await cb.answer()
 
