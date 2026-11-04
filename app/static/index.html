@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Домашки DSC</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #fff);
+    --text: var(--tg-theme-text-color, #111);
+    --hint: var(--tg-theme-hint-color, #888);
+    --link: var(--tg-theme-link-color, #2481cc);
+    --btn: var(--tg-theme-button-color, #2481cc);
+    --btn-text: var(--tg-theme-button-text-color, #fff);
+    --card: var(--tg-theme-secondary-bg-color, #f2f2f5);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px 16px 40px; font: 15px/1.4 system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+  nav { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  nav button.active { background: var(--btn); color: var(--btn-text); }
+  button { border: 0; border-radius: 8px; padding: 8px 12px; background: var(--card); color: var(--text); font: inherit; cursor: pointer; }
+  button.primary { background: var(--btn); color: var(--btn-text); }
+  button.back { background: none; padding: 4px 0; color: var(--link); margin-bottom: 6px; }
+  button:disabled { opacity: .5; }
+  .card { background: var(--card); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
+  .card h3 { margin: 0 0 6px; font-size: 16px; }
+  .hint { color: var(--hint); font-size: 13px; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
+  .task { border-top: 1px solid rgba(127,127,127,.25); padding-top: 8px; margin-top: 8px; }
+  .score { font-weight: 600; }
+  .comment { border-left: 3px solid var(--btn); padding-left: 8px; margin-top: 10px; white-space: pre-wrap; }
+  input, textarea { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid rgba(127,127,127,.35); background: var(--bg); color: var(--text); font: inherit; }
+  input.num { width: 64px; }
+  label { display: block; margin: 8px 0 4px; font-size: 13px; color: var(--hint); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { text-align: left; padding: 4px; border-bottom: 1px solid rgba(127,127,127,.2); vertical-align: top; }
+  .scroll { overflow-x: auto; }
+  pre { background: var(--bg); border-radius: 8px; padding: 8px; overflow-x: auto; font-size: 12px; margin: 6px 0; white-space: pre; }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; color: var(--link); }
+  .err { color: #d33; }
+  ul { margin: 4px 0; padding-left: 18px; }
+  a { color: var(--link); }
+  select { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid rgba(127,127,127,.35); background: var(--bg); color: var(--text); font: inherit; }
+  .subtabs { display: flex; gap: 6px; margin: 10px 0; }
+  .subtabs button.active { background: var(--btn); color: var(--btn-text); }
+  tr.me td { font-weight: 600; }
+  .desc { white-space: pre-wrap; margin: 6px 0; }
+  .check { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .check input { width: auto; }
+</style>
+</head>
+<body>
+<nav id="nav"></nav>
+<div id="msg"></div>
+<main id="view"><p class="hint">Загрузка…</p></main>
+
+<script>
+const tg = window.Telegram?.WebApp;
+tg?.ready(); tg?.expand();
+const initData = tg?.initData || "";
+let ME = null;
+const ICON = { correct: "✅", partial: "🟡", incorrect: "❌", not_done: "⬜" };
+const STATUS = { queued: "⏳ в очереди", checking: "🔎 проверяется", done: "готово", error: "⚠️ ошибка" };
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// Все даты показываем по Москве (TIMEZONE на сервере), независимо от часового пояса телефона
+let TZ = "Europe/Moscow";
+const fmt = (iso) => iso ? new Date(iso).toLocaleString("ru-RU", { timeZone: TZ, dateStyle: "short", timeStyle: "short" }) : "—";
+const fmtTz = (iso) => iso ? `${fmt(iso)} (МСК)` : "—";
+// ISO -> значение для <input type="datetime-local"> по московскому времени
+function toInput(iso) {
+  if (!iso) return "";
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit",
+    day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(iso)).map((p) => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
+}
+const num = (v) => v === null || v === undefined ? "—" : Number(v.toPrecision(5)).toString();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- запросы ----------
+async function api(path, opts = {}) {
+  const method = (opts.method || "GET").toUpperCase();
+  // GET-запросы повторяем при сетевом сбое (туннель иногда моргает)
+  const tries = method === "GET" ? 3 : 1;
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    let res;
+    try {
+      res = await fetch("/api" + path, { ...opts, headers: { ...(opts.headers || {}), "X-Telegram-Init-Data": initData } });
+    } catch (e) {
+      lastErr = new Error("Нет связи с сервером, попробуй ещё раз");
+      await sleep(600 * (i + 1));
+      continue;
+    }
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail || detail; } catch {}
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+    const ct = res.headers.get("content-type") || "";
+    return ct.includes("application/json") ? res.json() : res.blob();
+  }
+  throw lastErr;
+}
+const json = (method, body) => ({ method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+function flash(text, isErr = false) {
+  $("#msg").innerHTML = text ? `<div class="card ${isErr ? "err" : ""}">${esc(text)}</div>` : "";
+  if (text) setTimeout(() => { $("#msg").innerHTML = ""; }, 6000);
+}
+
+async function download(path, name) {
+  try {
+    const blob = await api(path);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  } catch (e) { flash(e.message, true); }
+}
+
+// ---------- навигация со стеком и кнопкой «Назад» ----------
+let stack = [];      // [{tab, render}]
+let renderSeq = 0;   // защита от «запоздавших» ответов при быстром переключении
+
+async function show(render, { push = true } = {}) {
+  if (push) stack.push(render);
+  const seq = ++renderSeq;
+  const depth = stack.length;
+  updateBackButton();
+  $("#view").innerHTML = `<p class="hint">Загрузка…</p>`;
+  try {
+    const html = await render();
+    if (seq !== renderSeq) return; // пользователь уже ушёл на другой экран
+    const back = depth > 1 ? `<button class="back" onclick="goBack()">← Назад</button>` : "";
+    $("#view").innerHTML = back + html;
+    render.after?.();
+  } catch (e) {
+    if (seq !== renderSeq) return;
+    $("#view").innerHTML = (depth > 1 ? `<button class="back" onclick="goBack()">← Назад</button>` : "") +
+      `<p class="err">${esc(e.message)}</p><button onclick="reload()">Повторить</button>`;
+  }
+}
+function goBack() { if (stack.length > 1) { stack.pop(); show(stack[stack.length - 1], { push: false }); } }
+function reload() { show(stack[stack.length - 1], { push: false }); }
+function updateBackButton() {
+  if (!tg?.BackButton) return;
+  stack.length > 1 ? tg.BackButton.show() : tg.BackButton.hide();
+}
+tg?.BackButton?.onClick(goBack);
+
+// ---------- задания ----------
+function assignmentsView() {
+  return async () => {
+    const list = await api("/assignments");
+    if (!list.length) return `<p class="hint">Пока нет открытых заданий.</p>`;
+    const refBtn = (a) => a.reference_available
+      ? `<button onclick="show(referenceView(${a.id}))">📗 Эталон</button>`
+      : "";
+    const warn = !ME.is_admin && !ME.profile.fio
+      ? `<div class="card">❗ Укажи ФИО во вкладке <a href="#" onclick="openTab('profile');return false">Профиль</a>, чтобы организаторы засчитали домашки.</div>` : "";
+    return warn + list.map((a) => `
+      <div class="card">
+        <h3>${esc(a.title)} ${a.is_active ? "" : '<span class="hint">(закрыто)</span>'}</h3>
+        ${!a.published ? `<div class="hint">🕒 Участники увидят задание ${fmtTz(a.publish_at)}</div>` : ""}
+        ${a.description ? `<div>${esc(a.description)}</div>` : ""}
+        <div class="hint">Заданий: ${a.task_count} · Попытки: ${a.attempts_used}/${a.max_attempts}
+          ${a.deadline ? ` · Дедлайн: ${fmtTz(a.deadline)}` : ""}
+          ${a.best_score !== null ? ` · Лучший: <span class="score">${a.best_score}/${a.max_score}</span>` : ""}</div>
+        <div class="row">
+          ${ME.bot_enabled ? `<button onclick="sendTemplate(${a.id})">📥 Шаблон в чат</button>` : ""}
+          <button onclick="download('/assignments/${a.id}/template', 'template.ipynb')">Скачать</button>
+          ${a.attempts_used ? `<button onclick="show(mySubsView(${a.id}))">🗂 Мои попытки и отзывы</button>` : ""}
+          ${refBtn(a)}
+        </div>
+        ${a.reference_available ? `<div class="hint">Дедлайн прошёл: можно сравнить своё решение с эталоном.</div>`
+          : `<div class="row">
+          <input type="file" accept=".ipynb" id="file-${a.id}" style="flex:1">
+          <button class="primary" onclick="submitWork(${a.id}, this)">📤 Сдать</button>
+        </div>${a.deadline ? `<div class="hint">Эталонное решение откроется после дедлайна.</div>` : ""}`}
+      </div>`).join("");
+  };
+}
+
+async function sendTemplate(id) {
+  try { await api(`/assignments/${id}/template/send`, { method: "POST" }); flash("Шаблон отправлен в чат с ботом"); }
+  catch (e) { flash(e.message, true); }
+}
+
+async function submitWork(id, btn) {
+  const input = $(`#file-${id}`);
+  if (!input.files.length) { flash("Выбери .ipynb файл", true); return; }
+  const fd = new FormData(); fd.append("file", input.files[0]);
+  btn.disabled = true;
+  try {
+    const sub = await api(`/assignments/${id}/submissions`, { method: "POST", body: fd });
+    flash("Работа принята, идёт проверка…");
+    show(submissionView(sub.id, true));
+  } catch (e) { flash(e.message, true); }
+  finally { btn.disabled = false; }
+}
+
+// ---------- сдачи ----------
+const attemptLabel = (s) => s.attempt ? `№${s.attempt}` : "—";
+function subsTable(subs, withTitle) {
+  return `<div class="scroll"><table>
+    <tr><th>Попытка</th>${withTitle ? "<th>Задание</th>" : ""}<th>Когда</th><th>Итог</th></tr>
+    ${subs.map((s) => `<tr><td><a href="#" onclick="show(submissionView(${s.id}));return false">${attemptLabel(s)}</a></td>
+      ${withTitle ? `<td>${esc(s.assignment_title)}</td>` : ""}<td>${fmt(s.created_at)}</td>
+      <td>${s.status === "done" ? `<span class="score">${s.score}/${s.max_score}</span>${s.organizer_comment ? " 💬" : ""}` : STATUS[s.status]}</td></tr>`).join("")}
+  </table></div>`;
+}
+
+function mySubsView(assignmentId = null) {
+  return async () => {
+    const subs = await api("/submissions" + (assignmentId ? `?assignment_id=${assignmentId}` : ""));
+    if (!subs.length) return `<p class="hint">Сдач пока нет.</p>`;
+    return `<div class="card">${assignmentId ? `<h3>${esc(subs[0].assignment_title)}</h3>` : ""}
+      <div class="hint">Нажми на номер попытки, чтобы открыть отзыв. «—» — проверка не удалась, попытка не засчитана.</div>${subsTable(subs, !assignmentId)}</div>`;
+  };
+}
+
+function taskBlock(t) {
+  const edited = t.auto_score !== null && t.auto_score !== undefined ? ` <span class="hint">(изменено организатором, было ${t.auto_score})</span>` : "";
+  return `<div class="task"><b>${ICON[t.verdict] || ""} Задание ${t.number}. ${esc(t.title)}</b> — <span class="score">${t.score}/10</span>${edited}
+    <div>${esc(t.feedback)}</div>
+    ${t.improvements?.length ? `<ul>${t.improvements.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}</div>`;
+}
+
+function submissionView(id, poll = false) {
+  const render = async () => {
+    let s = await api(`/submissions/${id}`);
+    if (poll) {
+      // ждём окончания проверки, но экран не блокируем дольше ~10 минут
+      for (let i = 0; i < 120 && (s.status === "queued" || s.status === "checking"); i++) {
+        if (i === 0) $("#view").innerHTML = `<p class="hint">Проверяем работу… обычно 1–3 минуты. Отзыв также придёт в чат с ботом.</p>`;
+        await sleep(5000);
+        s = await api(`/submissions/${id}`);
+      }
+    }
+    const attemptTxt = s.attempt ? `попытка №${s.attempt}` : "попытка не засчитана";
+    let html = `<div class="card"><h3>${esc(s.assignment_title)} · ${attemptTxt}${ME.is_admin ? ` <span class="hint">(id ${s.id})</span>` : ""}</h3>
+      ${s.user ? `<div>${esc(s.user.name)}${s.user.fio ? " · " + esc(s.user.fio) : ' · <span class="err">ФИО не указано</span>'}${s.user.username ? " · @" + esc(s.user.username) : ""} <span class="hint">(id ${s.user.tg_id})</span></div>` : ""}
+      <div class="hint">${fmt(s.created_at)} · ${STATUS[s.status]}</div>`;
+    if (s.status === "done" && s.result) {
+      const r = s.result;
+      const edited = s.auto_score !== null && s.auto_score !== s.score ? ` <span class="hint">(агент поставил ${s.auto_score})</span>` : "";
+      html += `<p class="score">Итог: ${r.score}/${r.max_score}${edited}</p><p>${esc(r.summary)}</p>`;
+      html += r.tasks.map(taskBlock).join("");
+      if (s.organizer_comment) html += `<div class="comment"><b>💬 Комментарий организатора</b>\n${esc(s.organizer_comment)}</div>`;
+      if (ME.is_admin && r.warnings?.length) html += `<p class="err">${esc(r.warnings.join("; "))}</p>`;
+      if (!ME.is_admin) html += `<div class="row"><button onclick="show(codeView(${s.id}))">🔍 Мой код${s.reference_available ? " и эталон" : ""}</button></div>`;
+    } else if (s.status === "error") {
+      html += `<p>Не получилось проверить автоматически, попытка не засчитана.</p>${s.error ? `<p class="err">${esc(s.error)}</p>` : ""}`;
+    } else {
+      html += `<p class="hint">Проверка ещё идёт. Отзыв придёт в чат с ботом.</p>`;
+    }
+    html += "</div>";
+    if (ME.is_admin) html += await adminSubmissionTools(s);
+    return html;
+  };
+  render.after = () => { const f = $("#review-form"); if (f) f.onsubmit = (ev) => saveReview(ev, id); };
+  return render;
+}
+
+// ---------- код участника и эталон ----------
+function codeView(id) {
+  return async () => {
+    const [s, code] = await Promise.all([api(`/submissions/${id}`), api(`/submissions/${id}/code`)]);
+    const hasRef = code.tasks.some((t) => t.reference !== null);
+    return `<div class="card"><h3>${esc(s.assignment_title)} · попытка №${s.attempt ?? "—"}</h3>
+      ${hasRef ? "" : `<div class="hint">Эталонное решение откроется после дедлайна.</div>`}
+      ${code.tasks.map((t) => `<div class="task"><b>Задание ${t.number}. ${esc(t.title)}</b>
+        <div class="hint">Твой код</div><pre>${esc(t.code || "(пусто)")}</pre>
+        ${t.reference !== null ? `<div class="hint">Эталон</div><pre>${esc(t.reference || "(нет)")}</pre>` : ""}</div>`).join("")}</div>`;
+  };
+}
+
+function referenceView(aid) {
+  return async () => {
+    const tasks = await api(`/assignments/${aid}/reference`);
+    return `<div class="card"><h3>📗 Эталонное решение</h3>
+      <div class="hint">Сравнить со своим кодом: «Мои сдачи» → попытка → «Мой код и эталон».</div>
+      ${tasks.map((t) => `<div class="task"><b>Задание ${t.number}. ${esc(t.title)}</b><pre>${esc(t.reference || "(нет)")}</pre></div>`).join("")}
+      <div class="row">${ME.bot_enabled ? `<button onclick="sendFile('/assignments/${aid}/reference/send', 'Эталон отправлен в чат')">📥 Ноутбук в чат</button>` : ""}
+        <button onclick="download('/assignments/${aid}/reference/file', 'reference.ipynb')">Скачать ноутбук</button></div></div>`;
+  };
+}
+
+async function sendFile(path, okText) {
+  try { await api(path, { method: "POST" }); flash(okText); } catch (e) { flash(e.message, true); }
+}
+
+// ---------- организаторам: код, оценка, комментарий ----------
+async function adminSubmissionTools(s) {
+  let html = `<div class="card"><h3>Код участника</h3>`;
+  try {
+    const code = await api(`/admin/submissions/${s.id}/code`);
+    html += code.tasks.map((t) => `<div class="task"><b>Задание ${t.number}. ${esc(t.title)}</b>
+        <pre>${esc(t.code || "(пусто)")}</pre>
+        <details><summary>Эталон</summary><pre>${esc(t.reference || "(нет)")}</pre></details></div>`).join("");
+    html += `<details><summary>Весь ноутбук (${code.cells.length} ячеек)</summary>
+      ${code.cells.map((c) => c.type === "code" ? `<pre>${esc(c.source)}</pre>` : `<div class="hint" style="white-space:pre-wrap;margin:6px 0">${esc(c.source)}</div>`).join("")}</details>`;
+  } catch (e) { html += `<p class="err">${esc(e.message)}</p>`; }
+  html += `<div class="row"><button onclick="download('/admin/submissions/${s.id}/file', 'submission_${s.id}.ipynb')">Скачать файл</button>
+    <button onclick="recheck(${s.id})">Перепроверить агентом</button></div></div>`;
+
+  if (s.status === "done" && s.result) {
+    html += `<div class="card"><h3>Оценка и комментарий организатора</h3>
+      <form id="review-form">
+        ${s.result.tasks.map((t) => `<div class="row"><input class="num" type="number" min="0" max="10" name="t${t.number}" value="${t.score}">
+          <span>Задание ${t.number}. ${esc(t.title)}</span></div>`).join("")}
+        <label>Комментарий участнику (придёт в чат с ботом)</label>
+        <textarea name="comment" rows="3">${esc(s.organizer_comment || "")}</textarea>
+        <div class="row"><button class="primary" type="submit">Сохранить и уведомить участника</button></div>
+      </form></div>`;
+  }
+  return html;
+}
+
+async function saveReview(ev, id) {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const task_scores = {};
+  for (const [k, v] of fd.entries()) if (k.startsWith("t")) task_scores[k.slice(1)] = Number(v);
+  const btn = ev.target.querySelector("button"); btn.disabled = true;
+  try {
+    await api(`/admin/submissions/${id}/review`, json("PATCH", { task_scores, comment: fd.get("comment") }));
+    flash("Сохранено, участник получил уведомление");
+    reload();
+  } catch (e) { flash(e.message, true); btn.disabled = false; }
+}
+
+async function recheck(id) {
+  try {
+    await api(`/admin/submissions/${id}/recheck`, { method: "POST" });
+    flash("Отправлено на перепроверку");
+    stack[stack.length - 1] = submissionView(id, true);
+    reload();
+  }
+  catch (e) { flash(e.message, true); }
+}
+
+// ---------- организаторам: задания ----------
+function adminView() {
+  const render = async () => {
+    const list = await api("/assignments");
+    return `
+      <div class="card"><h3>Новое задание</h3>
+        <form id="new-form">
+          <label>Название</label><input name="title" required>
+          <label>Описание для участников</label><textarea name="description" rows="2"></textarea>
+          <label>Лимит попыток</label><input name="max_attempts" type="number" min="1" placeholder="по умолчанию">
+          <label>Дедлайн, МСК (необязательно)</label><input name="deadline" type="datetime-local">
+          <label>Опубликовать в, МСК (пусто — сразу). Участники получат уведомление в это время</label><input name="publish_at" type="datetime-local">
+          <label>Шаблон для участников (.ipynb)</label><input name="template" type="file" accept=".ipynb" required>
+          <label>Эталонное решение (.ipynb)</label><input name="reference" type="file" accept=".ipynb" required>
+          <div class="row"><button class="primary" type="submit">Создать</button></div>
+        </form>
+        <div id="new-result"></div>
+      </div>
+      ${list.map((a) => `<div class="card"><h3>${esc(a.title)} <span class="hint">(id ${a.id})</span></h3>
+        <div class="hint">${!a.is_active ? "закрыто" : a.published ? "открыто" : `🕒 появится ${fmtTz(a.publish_at)}`} · заданий: ${a.task_count} · попыток: ${a.max_attempts}
+          ${a.deadline ? ` · дедлайн ${fmtTz(a.deadline)}` : ""}</div>
+        <div class="row">
+          <button onclick='show(editAssignmentView(${a.id}))'>✏️ Изменить</button>
+          <button onclick="show(adminSubsView(${a.id}))">Сдачи</button>
+          <button onclick="download('/admin/assignments/${a.id}/export.csv', 'results_${a.id}.csv')">CSV</button>
+          <button onclick="toggle(${a.id}, ${!a.is_active})">${a.is_active ? "Закрыть приём" : "Открыть приём"}</button>
+        </div></div>`).join("")}`;
+  };
+  render.after = () => {
+    $("#new-form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      if (!fd.get("max_attempts")) fd.delete("max_attempts");
+      const btn = ev.target.querySelector("button"); btn.disabled = true;
+      try {
+        const r = await api("/admin/assignments", { method: "POST", body: fd });
+        const when = fd.get("publish_at") ? `Участники увидят его ${esc(fd.get("publish_at").replace("T", " "))} (МСК) и получат уведомление.` : "Участникам ушло уведомление.";
+        $("#new-result").innerHTML = `<p>✅ Создано задание (id ${r.id}). ${when} Найдены задания:</p>
+          <ol>${r.tasks.map((t) => `<li>${esc(t.title)}</li>`).join("")}</ol>
+          ${r.warnings.length ? `<p class="err">${r.warnings.map(esc).join("<br>")}</p>` : ""}`;
+        ev.target.reset();
+        setTimeout(reload, 2500);
+      } catch (e) { $("#new-result").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+      finally { btn.disabled = false; }
+    };
+  };
+  return render;
+}
+
+async function toggle(id, active) {
+  try { await api(`/admin/assignments/${id}`, json("PATCH", { is_active: active })); reload(); }
+  catch (e) { flash(e.message, true); }
+}
+
+function editAssignmentView(id) {
+  const render = async () => {
+    const a = (await api("/assignments")).find((x) => x.id === id);
+    if (!a) throw new Error("Задание не найдено");
+    return `<div class="card"><h3>Изменить задание</h3>
+      <form id="edit-form">
+        <label>Название</label><input name="title" required value="${esc(a.title)}">
+        <label>Описание для участников</label><textarea name="description" rows="3">${esc(a.description)}</textarea>
+        <label>Лимит попыток</label><input name="max_attempts" type="number" min="1" value="${a.max_attempts}">
+        <label>Дедлайн, МСК (очисти поле, чтобы убрать)</label><input name="deadline" type="datetime-local" value="${toInput(a.deadline)}">
+        <label>Опубликовать в, МСК (очисти — открыть сразу)</label><input name="publish_at" type="datetime-local" value="${toInput(a.publish_at)}">
+        <label>Новый шаблон (.ipynb) — только если нужно заменить</label><input name="template" type="file" accept=".ipynb">
+        <label>Новый эталон (.ipynb) — только если нужно заменить</label><input name="reference" type="file" accept=".ipynb">
+        <div class="row"><button class="primary" type="submit">Сохранить</button></div>
+      </form><div id="edit-result"></div></div>`;
+  };
+  render.after = () => {
+    $("#edit-form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      for (const k of ["template", "reference"]) if (!fd.get(k)?.name) fd.delete(k);
+      const btn = ev.target.querySelector("button"); btn.disabled = true;
+      try {
+        const r = await api(`/admin/assignments/${id}/edit`, { method: "POST", body: fd });
+        $("#edit-result").innerHTML = `<p>✅ Сохранено.${r.files_changed ? ` Заданий в ноутбуке: ${r.tasks.length}.` : ""}</p>
+          ${r.warnings.length ? `<p class="err">${r.warnings.map(esc).join("<br>")}</p>` : ""}
+          ${r.files_changed ? `<p class="hint">Файлы заменены, старые оценки остались прежними.</p>
+            <button onclick="recheckAll(${id}, this)">Перепроверить все сдачи агентом</button>` : ""}`;
+      } catch (e) { $("#edit-result").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+      finally { btn.disabled = false; }
+    };
+  };
+  return render;
+}
+
+async function recheckAll(id, btn) {
+  if (!confirm("Перепроверить все сдачи по заданию? Участники получат новые отзывы.")) return;
+  btn.disabled = true;
+  try { const r = await api(`/admin/assignments/${id}/recheck`, { method: "POST" }); flash(`Отправлено на перепроверку: ${r.queued}`); }
+  catch (e) { flash(e.message, true); btn.disabled = false; }
+}
+
+function adminSubsView(id) {
+  return async () => {
+    const subs = await api(`/admin/assignments/${id}/submissions`);
+    return `<div class="card"><h3>Сдачи по заданию (id ${id})</h3>
+      <div class="hint">id — номер сдачи в системе (для /sub, /score), № — номер попытки участника.</div>
+      ${subs.length ? `<div class="scroll"><table><tr><th>id</th><th>№</th><th>Участник</th><th>ФИО</th><th>Когда</th><th>Итог</th></tr>
+        ${subs.map((s) => `<tr><td><a href="#" onclick="show(submissionView(${s.id}));return false">${s.id}</a></td><td>${attemptLabel(s)}</td>
+          <td>${esc(s.user?.name)}${s.user?.username ? `<div class="hint">@${esc(s.user.username)}</div>` : ""}</td>
+          <td>${s.user?.fio ? esc(s.user.fio) : '<span class="hint">—</span>'}</td>
+          <td>${fmt(s.created_at)}</td>
+          <td>${s.status === "done" ? `${s.score}/${s.max_score}${s.edited_at ? " ✏️" : ""}${s.organizer_comment ? " 💬" : ""}` : STATUS[s.status]}</td></tr>`).join("")}</table></div>`
+        : `<p class="hint">Сдач пока нет.</p>`}</div>`;
+  };
+}
+
+// ---------- организаторам: участники ----------
+function participantsView() {
+  return async () => {
+    const data = await api("/admin/participants");
+    if (!data.participants.length) return `<p class="hint">Участников пока нет.</p>`;
+    const head = data.assignments.map((a) => `<th>${esc(a.title)}</th>`).join("");
+    const rows = data.participants.map((p) => `<tr>
+      <td>${esc(p.name)}${p.username ? `<div class="hint">@${esc(p.username)}</div>` : ""}</td>
+      <td>${p.fio ? esc(p.fio) : '<span class="err">не указано</span>'}</td>
+      ${data.assignments.map((a) => { const x = p.assignments[a.id]; return `<td>${x ? `${x.best_score}/${x.max_score}` : '<span class="hint">—</span>'}</td>`; }).join("")}
+    </tr>`).join("");
+    return `<div class="card"><h3>Участники (${data.participants.length})</h3>
+      <div class="hint">Лучший результат по каждому заданию, «—» — не сдавал.</div>
+      <div class="scroll"><table><tr><th>Ник</th><th>ФИО</th>${head}</tr>${rows}</table></div></div>`;
+  };
+}
+
+// ---------- хакатоны ----------
+const HSUB = {};  // какая под-вкладка открыта у хакатона: "submit" | "lb"
+const STATUS_H = { upcoming: "скоро", running: "идёт", finished: "завершён" };
+const FILE_NAMES = { train: "📊 train", test: "🧪 test", baseline: "🧩 baseline", task: "📄 условие", solution: "🔒 ответы (solution)" };
+
+function hackathonsView() {
+  return async () => {
+    const list = await api("/hackathons");
+    const adminBar = ME.is_admin ? `<div class="row" style="margin-bottom:10px">
+      <button class="primary" onclick="show(hackathonFormView(null))">➕ Новый хакатон</button></div>` : "";
+    const visible = list.filter((h) => h.is_active || ME.is_admin);
+    if (!visible.length) return adminBar + `<div class="card">Ближайших мероприятий нет. Когда организаторы объявят хакатон, бот напишет.</div>`;
+    const running = visible.filter((h) => h.status === "running");
+    const upcoming = visible.filter((h) => h.status === "upcoming");
+    const finished = visible.filter((h) => h.status === "finished").reverse();
+    let html = adminBar;
+    for (const h of running) html += await hackathonBody(h);
+    for (const h of upcoming) html += `<div class="card"><h3>🏆 ${esc(h.title)}</h3>
+      <div>Ближайший хакатон пройдёт с <b>${fmt(h.starts_at)}</b> по <b>${fmt(h.ends_at)}</b> (МСК).</div>
+      <div class="hint">Условие и данные появятся здесь в момент старта.</div>${adminHackButtons(h)}</div>`;
+    if (finished.length) html += `<h3>Прошедшие</h3>` + finished.map((h) => `<div class="card"><h3>${esc(h.title)}</h3>
+      <div class="hint">${fmt(h.starts_at)} — ${fmt(h.ends_at)} (МСК)${h.my_best !== null ? ` · твой лучший: ${num(h.my_best)}` : ""}</div>
+      <div class="row"><button onclick="show(hackathonView(${h.id}))">Итоги и лидерборд</button></div>${adminHackButtons(h)}</div>`).join("");
+    if (!running.length && !upcoming.length) html = `<div class="card">Ближайших мероприятий нет.</div>` + html;
+    return html;
+  };
+}
+
+function adminHackButtons(h) {
+  if (!ME.is_admin) return "";
+  return `<div class="row">
+    <button onclick="show(hackathonFormView(${h.id}))">✏️ Изменить</button>
+    <button onclick="show(hackAllSubsView(${h.id}))">Все решения</button>
+    ${h.status === "upcoming" ? `<button onclick="show(hackathonView(${h.id}))">Предпросмотр</button>` : ""}
+    ${h.is_active ? "" : `<span class="hint">скрыт от участников</span>`}</div>`;
+}
+
+function hackathonView(id) {
+  return async () => hackathonBody(await api(`/hackathons/${id}`));
+}
+
+async function hackathonBody(h) {
+  const sub = HSUB[h.id] || "submit";
+  const files = Object.keys(FILE_NAMES).filter((k) => h.files[k]).map((k) => `<button onclick="download('/hackathons/${h.id}/files/${k}', ${esc(JSON.stringify(h.files[k]))})">${FILE_NAMES[k]}</button>
+    ${ME.bot_enabled ? `<button onclick="sendFile('/hackathons/${h.id}/files/${k}/send', 'Файл отправлен в чат')" title="в чат">↗</button>` : ""}`).join("");
+  let html = `<div class="card"><h3>🏆 ${esc(h.title)} <span class="hint">· ${STATUS_H[h.status]}</span></h3>
+    <div class="hint">С ${fmt(h.starts_at)} по ${fmt(h.ends_at)} (МСК) · метрика: ${esc(h.metric_title)} (${h.higher_is_better ? "больше" : "меньше"} — лучше)</div>
+    ${h.description ? `<details ${h.my_count ? "" : "open"}><summary>Условие</summary><div class="desc">${esc(h.description)}</div></details>` : ""}
+    ${files ? `<div class="row">${files}</div>` : ""}
+    <div class="subtabs">
+      <button class="${sub === "submit" ? "active" : ""}" onclick="HSUB[${h.id}]='submit';reload()">📤 Мои решения</button>
+      <button class="${sub === "lb" ? "active" : ""}" onclick="HSUB[${h.id}]='lb';reload()">🏅 Лидерборд</button>
+    </div>`;
+  if (sub === "submit") {
+    const mine = await api(`/hackathons/${h.id}/submissions`);
+    if (h.status === "running") html += `
+      <div class="hint">Файл .csv с колонками <b>${esc(h.id_column)}</b> и <b>${esc(h.target_column)}</b>, строка на каждый id из test.
+        Сегодня: ${h.used_today} из ${h.daily_limit} попыток (ошибочные файлы не считаются). Можно прислать .csv и прямо в чат с ботом.</div>
+      <div class="row"><input type="file" accept=".csv,.txt" id="hfile-${h.id}" style="flex:1">
+        <button class="primary" onclick="submitHack(${h.id}, this)">📤 Отправить</button></div>`;
+    else if (h.status === "finished") html += `<div class="hint">Приём решений закончился.</div>`;
+    html += mine.length ? `<div class="scroll"><table><tr><th>№</th><th>Когда</th><th>Результат</th><th>Файл</th></tr>
+      ${mine.map((x) => `<tr><td>${x.number}</td><td>${fmt(x.created_at)}</td>
+        <td>${x.status === "done" ? `<span class="score">${num(x.score)}</span>${x.score === h.my_best ? " ⭐" : ""}` : `<span class="err">${esc(x.error)}</span>`}</td>
+        <td class="hint">${esc(x.file_name)}</td></tr>`).join("")}</table></div>`
+      : `<p class="hint">Решений пока нет.</p>`;
+  } else {
+    const lb = await api(`/hackathons/${h.id}/leaderboard`);
+    html += lb.length ? `<div class="scroll"><table><tr><th>Место</th><th>Участник</th><th>${esc(h.metric_title)}</th><th>Попыток</th><th>Последняя</th></tr>
+      ${lb.map((r) => `<tr class="${r.is_me ? "me" : ""}"><td>${r.place}</td>
+        <td>${esc(r.name)}${r.is_me ? " (ты)" : ""}${r.user ? `<div class="hint">${esc(r.user.fio || "ФИО —")}${r.user.username ? " · @" + esc(r.user.username) : ""}</div>` : ""}</td>
+        <td class="score">${num(r.score)}</td><td>${r.attempts}</td><td>${fmt(r.last_at)}</td></tr>`).join("")}</table></div>
+      <div class="hint">В зачёт идёт лучший результат участника. При равенстве выше тот, кто отправил раньше.</div>`
+      : `<p class="hint">Пока нет ни одного решения.</p>`;
+  }
+  return html + adminHackButtons(h) + "</div>";
+}
+
+async function submitHack(id, btn) {
+  const input = $(`#hfile-${id}`);
+  if (!input.files.length) { flash("Выбери .csv файл", true); return; }
+  const fd = new FormData(); fd.append("file", input.files[0]);
+  btn.disabled = true;
+  try {
+    const r = await api(`/hackathons/${id}/submissions`, { method: "POST", body: fd });
+    r.status === "done" ? flash(`Решение №${r.number}: ${num(r.score)}`) : flash(`Решение №${r.number} не принято: ${r.error}`, true);
+    reload();
+  } catch (e) { flash(e.message, true); btn.disabled = false; }
+}
+
+function hackAllSubsView(id) {
+  return async () => {
+    const [h, subs] = await Promise.all([api(`/hackathons/${id}`), api(`/admin/hackathons/${id}/submissions`)]);
+    return `<div class="card"><h3>Все решения: ${esc(h.title)}</h3>
+      ${subs.length ? `<div class="scroll"><table><tr><th>id</th><th>Участник</th><th>№</th><th>Когда</th><th>Результат</th></tr>
+        ${subs.map((x) => `<tr><td>${x.id}</td><td>${esc(x.user.name)}<div class="hint">${esc(x.user.fio || "ФИО —")}${x.user.username ? " · @" + esc(x.user.username) : ""}</div></td>
+          <td>${x.number}</td><td>${fmt(x.created_at)}</td>
+          <td>${x.status === "done" ? num(x.score) : `<span class="err">${esc(x.error)}</span>`}</td></tr>`).join("")}</table></div>`
+        : `<p class="hint">Решений пока нет.</p>`}
+      <div class="row"><button onclick="download('/hackathons/${id}/files/solution', 'solution.csv')">Скачать ответы (solution)</button></div></div>`;
+  };
+}
+
+let METRICS = null;
+function hackathonFormView(id) {
+  const render = async () => {
+    METRICS = METRICS || await api("/metrics");
+    const h = id ? await api(`/hackathons/${id}`) : null;
+    const v = (k, d = "") => esc(h ? h[k] ?? d : d);
+    const req = h ? "" : "required";
+    const fileHint = (k) => h?.files[k] ? ` <span class="hint">сейчас: ${esc(h.files[k])}, выбери файл, чтобы заменить</span>` : "";
+    return `<div class="card"><h3>${h ? "Изменить хакатон" : "Новый хакатон"}</h3>
+      <form id="hack-form">
+        <label>Название</label><input name="title" required value="${v("title")}">
+        <label>Условие текстом${h ? "" : " (и/или файлом .md ниже)"}</label><textarea name="description" rows="5">${v("description")}</textarea>
+        <label>Условие файлом (.md / .txt), добавится к тексту${fileHint("task")}</label><input name="task" type="file" accept=".md,.txt">
+        <label>Начало, МСК</label><input name="starts_at" type="datetime-local" required value="${h ? toInput(h.starts_at) : ""}">
+        <label>Окончание (после него приём закрывается), МСК</label><input name="ends_at" type="datetime-local" required value="${h ? toInput(h.ends_at) : ""}">
+        <label>Целевая метрика лидерборда</label>
+        <select name="metric">${METRICS.map((m) => `<option value="${m.name}" ${h?.metric === m.name ? "selected" : ""}>${esc(m.title)} (${m.higher_is_better ? "больше" : "меньше"} — лучше)</option>`).join("")}</select>
+        <label>Колонка с id</label><input name="id_column" required value="${v("id_column", "id")}">
+        <label>Колонка с ответом (target)</label><input name="target_column" required value="${v("target_column", "target")}">
+        <label>Решений в день на участника</label><input name="daily_limit" type="number" min="1" value="${v("daily_limit", 5)}">
+        <label>train.csv (с ответами)${fileHint("train")}</label><input name="train" type="file" accept=".csv,.zip" ${req}>
+        <label>test.csv (без ответов)${fileHint("test")}</label><input name="test" type="file" accept=".csv" ${req}>
+        <label>Ответы на test — по ним считается метрика, участникам не видны${fileHint("solution")}</label><input name="solution" type="file" accept=".csv" ${req}>
+        <label>Бейзлайн (необязательно, .ipynb/.py)${fileHint("baseline")}</label><input name="baseline" type="file">
+        ${h ? `<div class="check"><input type="checkbox" name="is_active" value="true" ${h.is_active ? "checked" : ""} id="hact"><label for="hact" style="margin:0">Виден участникам</label></div>` : ""}
+        <div class="row"><button class="primary" type="submit">${h ? "Сохранить" : "Создать"}</button></div>
+        <div class="hint">Время — по Москве. ${h ? "Если заменить ответы, метрику или колонки, все решения пересчитаются." : "Участники получат анонс сразу, а в момент старта — сообщение, что хакатон начался."}</div>
+      </form><div id="hack-result"></div></div>`;
+  };
+  render.after = () => {
+    $("#hack-form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      for (const k of ["train", "test", "solution", "baseline", "task"]) if (!fd.get(k)?.name) fd.delete(k);
+      if (id) fd.set("is_active", ev.target.is_active.checked ? "true" : "false");
+      const btn = ev.target.querySelector("button[type=submit]"); btn.disabled = true;
+      try {
+        const r = await api(id ? `/admin/hackathons/${id}/edit` : "/admin/hackathons", { method: "POST", body: fd });
+        flash(id ? `Сохранено${r.rescored ? `, пересчитано решений: ${r.rescored}` : ""}` : "Хакатон создан");
+        goBack();
+      } catch (e) { $("#hack-result").innerHTML = `<p class="err">${esc(e.message)}</p>`; btn.disabled = false; }
+    };
+  };
+  return render;
+}
+
+// ---------- профиль ----------
+function profileView() {
+  const render = async () => {
+    const me = await api("/me"); ME = me;
+    const p = me.profile;
+    return `<div class="card"><h3>Профиль</h3>
+      <div class="hint">Telegram: ${esc(p.tg_name)}${p.username ? " (@" + esc(p.username) + ")" : ""}</div>
+      <form id="profile-form">
+        <label>Ник в боте (как тебя видят другие)</label>
+        <input name="nickname" maxlength="40" value="${esc(p.nickname || "")}" placeholder="${esc(p.tg_name)}">
+        <label>ФИО (видят только организаторы, нужно для зачёта)</label>
+        <input name="fio" maxlength="150" value="${esc(p.fio || "")}" placeholder="Иванов Иван Иванович">
+        <div class="row"><button class="primary" type="submit">Сохранить</button></div>
+      </form></div>`;
+  };
+  render.after = () => {
+    $("#profile-form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      try {
+        ME.profile = await api("/profile", json("PATCH", { nickname: fd.get("nickname"), fio: fd.get("fio") }));
+        flash("Сохранено");
+      } catch (e) { flash(e.message, true); }
+    };
+  };
+  return render;
+}
+
+// ---------- вкладки ----------
+function tabs() {
+  const t = [["assignments", "Задания", assignmentsView], ["mine", "Мои сдачи", () => mySubsView()],
+             ["hack", "Хакатоны", hackathonsView], ["profile", "Профиль", profileView]];
+  if (ME.is_admin) t.push(["admin", "Организаторам", adminView], ["people", "Участники", participantsView]);
+  return t;
+}
+function openTab(key) {
+  const tab = tabs().find((t) => t[0] === key);
+  $("#nav").innerHTML = tabs().map(([k, label]) => `<button class="${k === key ? "active" : ""}" onclick="openTab('${k}')">${label}</button>`).join("");
+  stack = [];
+  show(tab[2]());
+}
+
+(async () => {
+  try { ME = await api("/me"); TZ = ME.timezone || TZ; openTab("assignments"); }
+  catch (e) { $("#view").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+})();
+</script>
+</body>
+</html>
