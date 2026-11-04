@@ -126,6 +126,8 @@ def submission_to_dict(s: Submission, include_user: bool = False) -> dict:
         "edited_at": as_utc(s.edited_at).isoformat() if s.edited_at else None,
         "organizer_comment": s.organizer_comment,
         "comment_at": as_utc(s.comment_at).isoformat() if s.comment_at else None,
+        "edited_by": s.edited_by,
+        "comment_by": s.comment_by,
     }
     if include_user and s.user is not None:
         d["user"] = s.user.to_dict()
@@ -533,6 +535,7 @@ class HomeworkService:
             sub.status = "queued"
             sub.error = None
             sub.edited_at = None
+            sub.edited_by = None
             await s.commit()
         self._rechecks.add(submission_id)
         await self._queue.put(submission_id)
@@ -543,10 +546,13 @@ class HomeworkService:
         submission_id: int,
         task_scores: dict[int, int] | None = None,
         comment: str | None = None,
+        reviewer_id: int | None = None,
     ) -> Submission:
         """Организатор меняет баллы по заданиям и/или оставляет комментарий. Участник получает уведомление."""
         task_scores = task_scores or {}
         async with self.sm() as s:
+            reviewer = await s.get(User, reviewer_id) if reviewer_id is not None else None
+            reviewer_name = reviewer.display_name[:100] if reviewer else None
             sub = await s.get(Submission, submission_id)
             if sub is None:
                 raise ServiceError("Сдача не найдена")
@@ -581,12 +587,14 @@ class HomeworkService:
                 sub.result = result.to_dict()
                 edited = any(t.auto_score is not None for t in result.tasks)
                 sub.edited_at = utcnow() if edited else None
+                sub.edited_by = reviewer_name if edited else None
             comment_changed = False
             if comment is not None:
                 comment = comment.strip()[:3000] or None
                 if comment != sub.organizer_comment:
                     sub.organizer_comment = comment
                     sub.comment_at = utcnow() if comment else None
+                    sub.comment_by = reviewer_name if comment else None
                     comment_changed = bool(comment)
             await s.commit()
 
@@ -598,7 +606,8 @@ class HomeworkService:
                 for t, old, new in changes:
                     lines.append(f"• Задание {t.number}. {escape(t.title)}: {old} → {new}")
             if comment_changed:
-                lines.append(f"\n💬 Комментарий организатора:\n{escape(sub.organizer_comment)}")
+                author = f" ({escape(sub.comment_by)})" if sub.comment_by else ""
+                lines.append(f"\n💬 Комментарий организатора{author}:\n{escape(sub.organizer_comment)}")
             await self._notify(sub.user_id, ["\n".join(lines)])
         return sub
 

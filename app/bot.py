@@ -736,7 +736,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
                 return
             scores[int(k)] = int(v)
         try:
-            sub = await service.review(int(parts[0]), task_scores=scores)
+            sub = await service.review(int(parts[0]), task_scores=scores, reviewer_id=message.from_user.id)
         except ServiceError as e:
             await message.answer(f"❌ {escape(str(e))}")
             return
@@ -751,7 +751,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             await message.answer("Использование: <code>/comment &lt;id сдачи&gt; текст комментария</code>")
             return
         try:
-            await service.review(int(sid), comment=text)
+            await service.review(int(sid), comment=text, reviewer_id=message.from_user.id)
         except ServiceError as e:
             await message.answer(f"❌ {escape(str(e))}")
             return

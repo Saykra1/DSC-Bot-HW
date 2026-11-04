@@ -239,10 +239,12 @@ def test_admin_review_changes_scores_and_notifies(ctx):
     assert sent[-1][0] == STUDENT
     note = sent[-1][1][0]
     assert "16/20 → 15/20" in note and "Задание 2" in note and "нет X_test" in note
+    assert "(Test)" in note  # имя организатора рядом с комментарием
 
-    # участник видит комментарий и правку
+    # участник видит комментарий, правку и кто их сделал
     mine = client.get(f"/api/submissions/{sid}", headers=hdr(STUDENT)).json()
     assert mine["organizer_comment"].startswith("Молодец") and mine["score"] == 15
+    assert mine["comment_by"] == "Test" and mine["edited_by"] == "Test"
 
     # тот же комментарий и те же баллы — повторного уведомления нет
     sent.clear()
@@ -253,6 +255,7 @@ def test_admin_review_changes_scores_and_notifies(ctx):
     # вернули оценку агента — пометка «изменено» снимается
     r = client.patch(f"/api/admin/submissions/{sid}/review", headers=hdr(ADMIN), json={"task_scores": {"1": 8, "2": 8}}).json()
     assert r["score"] == 16 and r["edited_at"] is None and r["result"]["tasks"][0]["auto_score"] is None
+    assert r["edited_by"] is None and r["comment_by"] == "Test"
 
 
 async def test_migration_adds_new_columns_to_old_db(tmp_path):
@@ -270,3 +273,11 @@ async def test_migration_adds_new_columns_to_old_db(tmp_path):
     u = await service.update_profile(5, nickname="new", fio="Петров Пётр")
     assert u.username == "old" and u.nickname == "new"
     await engine.dispose()
+
+
+def test_index_serves_versioned_static(ctx):
+    client, _, _ = ctx
+    html = client.get("/").text
+    assert "__V__" not in html and "/static/app.js?v=" in html and "/static/app.css?v=" in html
+    assert client.get("/static/app.js").status_code == 200
+    assert "text/css" in client.get("/static/app.css").headers["content-type"]

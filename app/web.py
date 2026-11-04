@@ -12,7 +12,8 @@ from aiogram import Bot
 from aiogram.types import BufferedInputFile
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app import metrics
@@ -371,7 +372,7 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
     @api.patch("/admin/submissions/{sid}/review")
     async def review(sid: int, body: ReviewIn, user: AdminDep):
         try:
-            sub = await service.review(sid, body.task_scores, body.comment)
+            sub = await service.review(sid, body.task_scores, body.comment, reviewer_id=user.id)
         except ServiceError as e:
             raise err(e)
         sub = await service.get_submission(sub.id)
@@ -465,9 +466,14 @@ def build_app(service: HomeworkService, bot: Bot | None, lifespan=None) -> FastA
     app = FastAPI(title="DSC Homework Bot", lifespan=lifespan)
     app.include_router(build_api(service, bot))
 
+    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
     @app.get("/")
     async def index():
-        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+        # Версия в ссылках на css/js меняется при каждом изменении файлов, чтобы Telegram не держал старые
+        version = str(max(int((STATIC / name).stat().st_mtime) for name in ("app.css", "app.js")))
+        html = (STATIC / "index.html").read_text(encoding="utf-8").replace("__V__", version)
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     @app.get("/health")
     async def health():
