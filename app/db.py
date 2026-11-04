@@ -127,8 +127,10 @@ class Submission(Base):
     error: Mapped[str | None] = mapped_column(Text)
     auto_score: Mapped[int | None] = mapped_column(Integer)  # оценка агента до правок организатора
     edited_at: Mapped[datetime | None] = mapped_column(UTCDateTime)  # когда организатор менял баллы
+    edited_by: Mapped[str | None] = mapped_column(String(100))  # имя организатора, который менял баллы
     organizer_comment: Mapped[str | None] = mapped_column(Text)
     comment_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    comment_by: Mapped[str | None] = mapped_column(String(100))  # имя организатора, который оставил комментарий
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
