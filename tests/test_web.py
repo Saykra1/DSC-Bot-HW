@@ -90,8 +90,8 @@ def test_auth_required_and_signature_checked(ctx):
     assert client.get("/api/me", headers=bad).status_code == 401
     old = {"X-Telegram-Init-Data": init_data(STUDENT, auth_date=int(time.time()) - 3 * 24 * 3600)}
     assert client.get("/api/me", headers=old).status_code == 401
-    r = client.get("/api/me", headers=hdr(STUDENT))
-    assert r.json() == {"id": STUDENT, "is_admin": False, "bot_enabled": False}
+    r = client.get("/api/me", headers=hdr(STUDENT)).json()
+    assert r["id"] == STUDENT and r["is_admin"] is False and r["profile"]["username"] == f"user{STUDENT}"
 
 
 def test_student_cannot_use_admin_api(ctx):
@@ -145,7 +145,8 @@ def test_rejects_bad_files_and_closed_assignment(ctx):
     r = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.py", TEMPLATE)})
     assert r.status_code == 400
 
-    client.patch(f"/api/admin/assignments/{aid}", headers=hdr(ADMIN), data={"is_active": "false"})
+    r = client.patch(f"/api/admin/assignments/{aid}", headers=hdr(ADMIN), json={"is_active": False})
+    assert r.status_code == 200
     assert client.get("/api/assignments", headers=hdr(STUDENT)).json() == []
     r = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", TEMPLATE)})
     assert r.status_code == 400 and "закрыт" in r.json()["detail"]
@@ -182,3 +183,84 @@ def test_llm_failure_marks_error_and_does_not_burn_attempt(ctx):
     service.llm = FakeLLM()
     client.post(f"/api/admin/submissions/{res['id']}/recheck", headers=hdr(ADMIN))
     assert wait_done(client, res["id"], STUDENT)["status"] == "done"
+
+
+def test_profile_and_participants(ctx):
+    client, _, _ = ctx
+    aid = create_assignment(client)
+    r = client.patch("/api/profile", headers=hdr(STUDENT), json={"nickname": "  Кот  ", "fio": "Иванов Иван Иванович"})
+    assert r.status_code == 200 and r.json()["nickname"] == "Кот" and r.json()["fio"] == "Иванов Иван Иванович"
+    assert client.patch("/api/profile", headers=hdr(STUDENT), json={"fio": "Иван"}).status_code == 400
+    # nickname не трогаем, если поле не передано
+    assert client.patch("/api/profile", headers=hdr(STUDENT), json={"fio": ""}).json()["nickname"] == "Кот"
+
+    sid = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", REFERENCE)}).json()["id"]
+    wait_done(client, sid, STUDENT)
+    client.get("/api/me", headers=hdr(3))  # участник без сдач
+
+    assert client.get("/api/admin/participants", headers=hdr(STUDENT)).status_code == 403
+    data = client.get("/api/admin/participants", headers=hdr(ADMIN)).json()
+    people = {p["tg_id"]: p for p in data["participants"]}
+    assert ADMIN not in people
+    assert people[STUDENT]["nickname"] == "Кот" and people[STUDENT]["assignments"][str(aid)]["best_score"] == 20
+    assert people[3]["assignments"] == {}
+
+    csv_text = client.get(f"/api/admin/assignments/{aid}/export.csv", headers=hdr(ADMIN)).content.decode("utf-8-sig")
+    assert "nickname,fio" in csv_text.splitlines()[0] and ",Кот," in csv_text
+
+
+def test_admin_review_changes_scores_and_notifies(ctx):
+    client, _, sent = ctx
+    aid = create_assignment(client)
+    student = make_student({14: "x = 1\n", 25: "y = 2\n"})
+    sid = client.post(f"/api/assignments/{aid}/submissions", headers=hdr(STUDENT), files={"file": ("hw.ipynb", student)}).json()["id"]
+    assert wait_done(client, sid, STUDENT)["score"] == 16
+
+    code = client.get(f"/api/admin/submissions/{sid}/code", headers=hdr(ADMIN)).json()
+    assert code["tasks"][0]["code"].strip() == "x = 1" and "fillna(median)" in code["tasks"][0]["reference"]
+    assert any("y = 2" in c["source"] for c in code["cells"])
+    assert client.get(f"/api/admin/submissions/{sid}/code", headers=hdr(STUDENT)).status_code == 403
+
+    assert client.patch(f"/api/admin/submissions/{sid}/review", headers=hdr(STUDENT), json={"comment": "x"}).status_code == 403
+    assert client.patch(f"/api/admin/submissions/{sid}/review", headers=hdr(ADMIN), json={"task_scores": {"1": 11}}).status_code == 400
+
+    sent.clear()
+    r = client.patch(f"/api/admin/submissions/{sid}/review", headers=hdr(ADMIN),
+                     json={"task_scores": {"1": 10, "2": 5}, "comment": "Молодец, но во втором задании нет X_test"})
+    body = r.json()
+    assert body["score"] == 15 and body["auto_score"] == 16 and body["edited_at"]
+    assert body["result"]["tasks"][0]["auto_score"] == 8 and body["result"]["tasks"][1]["verdict"] == "partial"
+    assert sent[-1][0] == STUDENT
+    note = sent[-1][1][0]
+    assert "16/20 → 15/20" in note and "Задание 2" in note and "нет X_test" in note
+
+    # участник видит комментарий и правку
+    mine = client.get(f"/api/submissions/{sid}", headers=hdr(STUDENT)).json()
+    assert mine["organizer_comment"].startswith("Молодец") and mine["score"] == 15
+
+    # тот же комментарий и те же баллы — повторного уведомления нет
+    sent.clear()
+    client.patch(f"/api/admin/submissions/{sid}/review", headers=hdr(ADMIN),
+                 json={"task_scores": {"1": 10}, "comment": "Молодец, но во втором задании нет X_test"})
+    assert sent == []
+
+    # вернули оценку агента — пометка «изменено» снимается
+    r = client.patch(f"/api/admin/submissions/{sid}/review", headers=hdr(ADMIN), json={"task_scores": {"1": 8, "2": 8}}).json()
+    assert r["score"] == 16 and r["edited_at"] is None and r["result"]["tasks"][0]["auto_score"] is None
+
+
+async def test_migration_adds_new_columns_to_old_db(tmp_path):
+    import sqlite3
+    db = tmp_path / "bot.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE users (tg_id BIGINT PRIMARY KEY, username VARCHAR(64), full_name VARCHAR(256), created_at DATETIME)")
+    con.execute("INSERT INTO users VALUES (5, 'old', 'Old User', '2026-11-01 10:00:00')")
+    con.commit(); con.close()
+
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    engine = make_engine(settings.db_url)
+    await init_db(engine)
+    service = HomeworkService(settings, make_sessionmaker(engine), None)
+    u = await service.update_profile(5, nickname="new", fio="Петров Пётр")
+    assert u.username == "old" and u.nickname == "new"
+    await engine.dispose()

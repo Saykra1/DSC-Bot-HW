@@ -66,6 +66,7 @@ async def setup_bot_ui(bot: Bot, webapp_url: str) -> None:
         [
             BotCommand(command="tasks", description="Домашние задания"),
             BotCommand(command="my", description="Мои сдачи и отзывы"),
+            BotCommand(command="profile", description="Профиль: ник и ФИО"),
             BotCommand(command="help", description="Как сдавать домашки"),
         ]
     )
@@ -104,11 +105,57 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             "2. Допиши код в ячейках с заданиями.\n"
             "3. Нажми «Сдать работу» и пришли .ipynb файлом.\n"
             "4. Через пару минут придёт оценка и отзыв по коду.\n\n"
-            "/my — твои сдачи и отзывы."
+            "/my — твои сдачи и отзывы.\n/profile — ник и ФИО."
         )
+        user = await service.get_user(message.from_user.id)
+        if not user.fio and not service.is_admin(message.from_user.id):
+            text += ("\n\n❗ Укажи ФИО, чтобы организаторы засчитали твои домашки:\n"
+                     "<code>/fio Иванов Иван Иванович</code>")
         if service.is_admin(message.from_user.id):
             text += "\n\nТы организатор: /admin — управление заданиями."
         await message.answer(text, reply_markup=webapp_kb())
+
+    # ---------- профиль ----------
+
+    def profile_text(u) -> str:
+        return (
+            "<b>Профиль</b>\n"
+            f"Ник в боте: {escape(u.nickname or '— (используется имя из Telegram)')}\n"
+            f"ФИО: {escape(u.fio or '— не указано')}\n"
+            f"Telegram: {escape(u.full_name)}{' (@' + escape(u.username) + ')' if u.username else ''}\n\n"
+            "Изменить:\n<code>/name Новый ник</code>\n<code>/fio Фамилия Имя Отчество</code>"
+        )
+
+    @router.message(Command("profile"))
+    async def profile_cmd(message: Message):
+        await touch(message.from_user)
+        await message.answer(profile_text(await service.get_user(message.from_user.id)))
+
+    @router.message(Command("name"))
+    async def name_cmd(message: Message, command: CommandObject):
+        await touch(message.from_user)
+        if not command.args:
+            await message.answer("Напиши ник после команды: <code>/name Мой ник</code>")
+            return
+        try:
+            u = await service.update_profile(message.from_user.id, nickname=command.args)
+        except ServiceError as e:
+            await message.answer(f"❌ {escape(str(e))}")
+            return
+        await message.answer(f"Готово, ник: {escape(u.nickname)}")
+
+    @router.message(Command("fio"))
+    async def fio_cmd(message: Message, command: CommandObject):
+        await touch(message.from_user)
+        if not command.args:
+            await message.answer("Напиши ФИО после команды: <code>/fio Иванов Иван Иванович</code>")
+            return
+        try:
+            u = await service.update_profile(message.from_user.id, fio=command.args)
+        except ServiceError as e:
+            await message.answer(f"❌ {escape(str(e))}")
+            return
+        await message.answer(f"Готово, ФИО: {escape(u.fio)}")
 
     @router.message(Command("help"))
     async def help_cmd(message: Message):
@@ -362,7 +409,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             await message.answer("Это не твоя сдача.")
             return
         if admin_view:
-            await message.answer(f"Участник: {escape(sub.user.display_name)} (id {sub.user_id})")
+            await message.answer(f"Участник: {escape(sub.user.admin_label)} (id {sub.user_id})")
         if sub.status != "done":
             text = f"Статус: {STATUS_TEXT.get(sub.status, sub.status)}"
             if sub.error and admin_view:
@@ -370,7 +417,9 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             await message.answer(text)
         else:
             attempt = await service.attempt_number(sub)
-            for text in feedback_messages(sub.assignment.title, attempt, CheckResult.from_dict(sub.result)):
+            for text in feedback_messages(
+                sub.assignment.title, attempt, CheckResult.from_dict(sub.result), sub.organizer_comment
+            ):
                 await message.answer(text)
             if admin_view and sub.result and sub.result.get("warnings"):
                 await message.answer("⚠️ " + escape("; ".join(sub.result["warnings"])))
@@ -392,6 +441,9 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             "/new — создать задание (шаблон + эталон)",
             "/sub &lt;id&gt; — отзыв и файл конкретной сдачи",
             "/recheck &lt;id&gt; — перепроверить сдачу",
+            "/score &lt;id&gt; &lt;задание&gt;=&lt;балл&gt; … — изменить баллы, например <code>/score 12 2=8 3=10</code>",
+            "/comment &lt;id&gt; &lt;текст&gt; — комментарий участнику от организатора",
+            "Удобнее всего всё это делать в мини аппе.",
             "",
         ]
         rows = []
@@ -441,7 +493,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         lines = [f"Сдачи по заданию #{aid} (последние 40):"]
         for s in subs[:40]:
             score = f"{s.score}/{s.max_score}" if s.status == "done" else STATUS_TEXT.get(s.status, s.status)
-            lines.append(f"/sub {s.id} · {escape(s.user.display_name)} · {score}")
+            lines.append(f"/sub {s.id} · {escape(s.user.admin_label)} · {score}")
         await cb.message.answer("\n".join(lines))
         await cb.answer()
 
@@ -475,5 +527,43 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             await message.answer(escape(str(e)))
             return
         await message.answer("Отправил на перепроверку, результат придёт участнику.")
+
+    @router.message(Command("score"))
+    async def score_cmd(message: Message, command: CommandObject):
+        if not is_admin(message):
+            return
+        parts = (command.args or "").split()
+        usage = "Использование: <code>/score &lt;id сдачи&gt; 1=8 2=10</code>"
+        if len(parts) < 2 or not parts[0].isdigit():
+            await message.answer(usage)
+            return
+        scores = {}
+        for p in parts[1:]:
+            k, _, v = p.partition("=")
+            if not (k.isdigit() and v.isdigit()):
+                await message.answer(usage)
+                return
+            scores[int(k)] = int(v)
+        try:
+            sub = await service.review(int(parts[0]), task_scores=scores)
+        except ServiceError as e:
+            await message.answer(f"❌ {escape(str(e))}")
+            return
+        await message.answer(f"Готово: {sub.score}/{sub.max_score}. Участник получил уведомление.")
+
+    @router.message(Command("comment"))
+    async def comment_cmd(message: Message, command: CommandObject):
+        if not is_admin(message):
+            return
+        sid, _, text = (command.args or "").strip().partition(" ")
+        if not sid.isdigit() or not text.strip():
+            await message.answer("Использование: <code>/comment &lt;id сдачи&gt; текст комментария</code>")
+            return
+        try:
+            await service.review(int(sid), comment=text)
+        except ServiceError as e:
+            await message.answer(f"❌ {escape(str(e))}")
+            return
+        await message.answer("Комментарий отправлен участнику.")
 
     return dp

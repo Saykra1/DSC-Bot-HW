@@ -13,11 +13,26 @@ from aiogram.types import BufferedInputFile
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
 
 from app.service import HomeworkService, ServiceError, submission_to_dict
 
 STATIC = Path(__file__).parent / "static"
 INIT_DATA_MAX_AGE = 24 * 3600
+
+
+class ProfileIn(BaseModel):
+    nickname: str | None = None
+    fio: str | None = None
+
+
+class ActiveIn(BaseModel):
+    is_active: bool
+
+
+class ReviewIn(BaseModel):
+    task_scores: dict[int, int] = {}
+    comment: str | None = None
 
 
 @dataclass
@@ -67,7 +82,16 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
 
     @api.get("/me")
     async def me(user: UserDep):
-        return {"id": user.id, "is_admin": user.is_admin, "bot_enabled": bot is not None}
+        u = await service.get_user(user.id)
+        return {"id": user.id, "is_admin": user.is_admin, "bot_enabled": bot is not None, "profile": u.to_dict()}
+
+    @api.patch("/profile")
+    async def update_profile(body: ProfileIn, user: UserDep):
+        try:
+            u = await service.update_profile(user.id, body.nickname, body.fio)
+        except ServiceError as e:
+            raise err(e)
+        return u.to_dict()
 
     @api.get("/assignments")
     async def assignments(user: UserDep):
@@ -151,9 +175,9 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         return {"id": a.id, "warnings": warnings, "tasks": [{"number": t.number, "title": t.title} for t in prepared.tasks]}
 
     @api.patch("/admin/assignments/{aid}")
-    async def update_assignment(aid: int, user: AdminDep, is_active: Annotated[bool, Form()]):
+    async def update_assignment(aid: int, body: ActiveIn, user: AdminDep):
         try:
-            a = await service.set_active(aid, is_active)
+            a = await service.set_active(aid, body.is_active)
         except ServiceError as e:
             raise HTTPException(404, str(e))
         return {"id": a.id, "is_active": a.is_active}
@@ -179,6 +203,30 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         except ServiceError as e:
             raise err(e)
         return {"id": sub.id, "status": "queued"}
+
+    @api.get("/admin/submissions/{sid}/code")
+    async def submission_code(sid: int, user: AdminDep):
+        try:
+            return await service.submission_code(sid)
+        except ServiceError as e:
+            raise HTTPException(404, str(e))
+
+    @api.patch("/admin/submissions/{sid}/review")
+    async def review(sid: int, body: ReviewIn, user: AdminDep):
+        try:
+            sub = await service.review(sid, body.task_scores, body.comment)
+        except ServiceError as e:
+            raise err(e)
+        sub = await service.get_submission(sub.id)
+        return submission_to_dict(sub, include_user=True) | {"assignment_title": sub.assignment.title}
+
+    @api.get("/admin/participants")
+    async def participants(user: AdminDep):
+        assignments, rows = await service.participants()
+        return {
+            "assignments": [{"id": a.id, "title": a.title, "max_score": a.task_count * 10} for a in assignments],
+            "participants": rows,
+        }
 
     @api.get("/admin/submissions/{sid}/file")
     async def submission_file(sid: int, user: AdminDep):

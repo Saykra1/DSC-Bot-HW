@@ -23,7 +23,9 @@ def fmt_dt(dt: datetime | None, tz: ZoneInfo) -> str:
     return dt.astimezone(tz).strftime("%d.%m.%Y %H:%M") if dt else "—"
 
 
-def feedback_messages(assignment_title: str, attempt: int, result: CheckResult) -> list[str]:
+def feedback_messages(
+    assignment_title: str, attempt: int, result: CheckResult, organizer_comment: str | None = None
+) -> list[str]:
     """Отзыв, разбитый на сообщения не длиннее лимита Telegram."""
     head = (
         f"📝 <b>{escape(assignment_title)}</b>, попытка {attempt}\n"
@@ -31,12 +33,15 @@ def feedback_messages(assignment_title: str, attempt: int, result: CheckResult) 
     )
     blocks = [head]
     for t in result.tasks:
-        lines = [f"{VERDICT_ICON.get(t.verdict, '•')} <b>Задание {t.number}. {escape(t.title)}</b> — {t.score}/10"]
+        edited = f" (изменено организатором, было {t.auto_score})" if t.auto_score is not None else ""
+        lines = [f"{VERDICT_ICON.get(t.verdict, '•')} <b>Задание {t.number}. {escape(t.title)}</b> — {t.score}/10{edited}"]
         if t.feedback:
             lines.append(escape(t.feedback))
         for imp in t.improvements:
             lines.append(f"• {escape(imp)}")
         blocks.append("\n".join(lines))
+    if organizer_comment:
+        blocks.append(f"💬 <b>Комментарий организатора:</b>\n{escape(organizer_comment)}")
     return pack(blocks)
 
 

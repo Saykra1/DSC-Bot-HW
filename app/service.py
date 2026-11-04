@@ -17,11 +17,20 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm import selectinload
 
-from app.checker import CheckResult, JsonLLM, PreparedAssignment, check_submission, prepare_assignment
+from app.checker import (
+    MAX_TASK_SCORE,
+    CheckResult,
+    JsonLLM,
+    PreparedAssignment,
+    TaskResult,
+    verdict_for,
+    check_submission,
+    prepare_assignment,
+)
 from app.config import Settings
 from app.db import Assignment, Submission, User, utcnow
 from app.formatting import as_utc, feedback_messages
-from app.notebook import NotebookError, load_notebook, strip_outputs
+from app.notebook import NotebookError, load_notebook, match_tasks, strip_outputs
 
 log = logging.getLogger(__name__)
 
@@ -68,9 +77,13 @@ def submission_to_dict(s: Submission, include_user: bool = False) -> dict:
         "checked_at": as_utc(s.checked_at).isoformat() if s.checked_at else None,
         "result": s.result,
         "error": s.error,
+        "auto_score": s.auto_score,
+        "edited_at": as_utc(s.edited_at).isoformat() if s.edited_at else None,
+        "organizer_comment": s.organizer_comment,
+        "comment_at": as_utc(s.comment_at).isoformat() if s.comment_at else None,
     }
     if include_user and s.user is not None:
-        d["user"] = {"tg_id": s.user.tg_id, "name": s.user.display_name}
+        d["user"] = s.user.to_dict()
     return d
 
 
@@ -102,6 +115,57 @@ class HomeworkService:
 
     def is_admin(self, tg_id: int) -> bool:
         return self.settings.is_admin(tg_id)
+
+    async def get_user(self, tg_id: int) -> User:
+        async with self.sm() as s:
+            user = await s.get(User, tg_id)
+            if user is None:
+                raise ServiceError("Пользователь не найден")
+            return user
+
+    async def update_profile(self, tg_id: int, nickname: str | None = None, fio: str | None = None) -> User:
+        """None — не менять поле, пустая строка — очистить."""
+        async with self.sm() as s:
+            user = await s.get(User, tg_id)
+            if user is None:
+                raise ServiceError("Сначала напиши боту /start")
+            if nickname is not None:
+                nickname = " ".join(nickname.split())
+                if len(nickname) > 40:
+                    raise ServiceError("Ник слишком длинный (максимум 40 символов)")
+                user.nickname = nickname or None
+            if fio is not None:
+                fio = " ".join(fio.split())
+                if len(fio) > 150:
+                    raise ServiceError("ФИО слишком длинное")
+                if fio and len(fio.split()) < 2:
+                    raise ServiceError("Напиши ФИО полностью, например: Иванов Иван Иванович")
+                user.fio = fio or None
+            await s.commit()
+            return user
+
+    async def participants(self) -> tuple[list[Assignment], list[dict]]:
+        """Все участники и их лучший результат по каждому заданию — чтобы отмечать, кто сдал."""
+        async with self.sm() as s:
+            assignments = list((await s.scalars(select(Assignment).order_by(Assignment.id))).all())
+            users = list((await s.scalars(select(User).order_by(User.created_at))).all())
+            rows = await s.execute(
+                select(Submission.user_id, Submission.assignment_id, func.max(Submission.score), func.count(Submission.id))
+                .where(Submission.status == "done")
+                .group_by(Submission.user_id, Submission.assignment_id)
+            )
+            best: dict[tuple[int, int], tuple[int, int]] = {(u, a): (sc, n) for u, a, sc, n in rows}
+        result = []
+        for u in users:
+            if self.is_admin(u.tg_id):
+                continue
+            per = {}
+            for a in assignments:
+                if (u.tg_id, a.id) in best:
+                    sc, n = best[(u.tg_id, a.id)]
+                    per[str(a.id)] = {"best_score": sc, "max_score": a.task_count * 10, "attempts": n}
+            result.append(u.to_dict() | {"assignments": per})
+        return assignments, result
 
     # ---------- задания ----------
 
@@ -290,9 +354,90 @@ class HomeworkService:
                 raise ServiceError("Сдача уже в очереди")
             sub.status = "queued"
             sub.error = None
+            sub.edited_at = None
             await s.commit()
         await self._queue.put(submission_id)
         return sub
+
+    async def review(
+        self,
+        submission_id: int,
+        task_scores: dict[int, int] | None = None,
+        comment: str | None = None,
+    ) -> Submission:
+        """Организатор меняет баллы по заданиям и/или оставляет комментарий. Участник получает уведомление."""
+        task_scores = task_scores or {}
+        async with self.sm() as s:
+            sub = await s.get(Submission, submission_id)
+            if sub is None:
+                raise ServiceError("Сдача не найдена")
+            if sub.status != "done" or not sub.result:
+                raise ServiceError("Менять оценку можно только у проверенной работы")
+            a = await s.get(Assignment, sub.assignment_id)
+            result = CheckResult.from_dict(sub.result)
+            by_num = {t.number: t for t in result.tasks}
+            changes: list[tuple[TaskResult, int, int]] = []
+            for num, new in task_scores.items():
+                t = by_num.get(int(num))
+                if t is None:
+                    raise ServiceError(f"Нет задания {num}")
+                new = int(new)
+                if not 0 <= new <= MAX_TASK_SCORE:
+                    raise ServiceError(f"Оценка должна быть от 0 до {MAX_TASK_SCORE}")
+                if new == t.score:
+                    continue
+                if t.auto_score is None:
+                    t.auto_score = t.score
+                changes.append((t, t.score, new))
+                t.score = new
+                t.verdict = verdict_for(new)
+                if t.auto_score == new:  # вернули оценку агента
+                    t.auto_score = None
+            old_total = sub.score or 0
+            if changes:
+                if sub.auto_score is None:
+                    sub.auto_score = old_total
+                result.score = sum(t.score for t in result.tasks)
+                sub.score = result.score
+                sub.result = result.to_dict()
+                edited = any(t.auto_score is not None for t in result.tasks)
+                sub.edited_at = utcnow() if edited else None
+            comment_changed = False
+            if comment is not None:
+                comment = comment.strip()[:3000] or None
+                if comment != sub.organizer_comment:
+                    sub.organizer_comment = comment
+                    sub.comment_at = utcnow() if comment else None
+                    comment_changed = bool(comment)
+            await s.commit()
+
+        if changes or comment_changed:
+            attempt = await self.attempt_number(sub)
+            lines = [f"✏️ Организатор посмотрел твою работу «{escape(a.title)}» (попытка {attempt})."]
+            if changes:
+                lines.append(f"Оценка изменена: <b>{old_total}/{sub.max_score} → {sub.score}/{sub.max_score}</b>")
+                for t, old, new in changes:
+                    lines.append(f"• Задание {t.number}. {escape(t.title)}: {old} → {new}")
+            if comment_changed:
+                lines.append(f"\n💬 Комментарий организатора:\n{escape(sub.organizer_comment)}")
+            await self._notify(sub.user_id, ["\n".join(lines)])
+        return sub
+
+    async def submission_code(self, submission_id: int) -> dict:
+        """Код участника: по заданиям (как его увидел агент) и все кодовые ячейки ноутбука."""
+        sub = await self.get_submission(submission_id)
+        raw = Path(sub.file_path).read_bytes()
+        cells = load_notebook(raw)
+        prepared = await self._get_prepared(sub.assignment)
+        matches = match_tasks(prepared.template, cells, prepared.tasks)
+        return {
+            "tasks": [
+                {"number": m.task.number, "title": m.task.title, "code": m.code,
+                 "reference": prepared.reference_code.get(m.task.number, "")}
+                for m in matches
+            ],
+            "cells": [{"index": c.index, "type": c.cell_type, "source": c.source} for c in cells if c.source.strip()],
+        }
 
     async def export_csv(self, assignment_id: int) -> str:
         """Лучший результат каждого участника по заданию."""
@@ -308,12 +453,14 @@ class HomeworkService:
                 best[sub.user_id] = sub
         buf = io.StringIO()
         w = csv.writer(buf)
-        header = ["tg_id", "username", "name", "best_score", "max_score", "attempts"]
+        header = ["tg_id", "username", "nickname", "fio", "tg_name", "best_score", "max_score", "attempts"]
         header += [f"task_{i}" for i in range(1, a.task_count + 1)]
         w.writerow(header)
         for uid, sub in sorted(best.items(), key=lambda kv: -(kv[1].score or 0)):
             task_scores = [t.get("score") for t in (sub.result or {}).get("tasks", [])]
-            w.writerow([uid, sub.user.username or "", sub.user.full_name, sub.score, sub.max_score, attempts[uid], *task_scores])
+            u = sub.user
+            w.writerow([uid, u.username or "", u.nickname or "", u.fio or "", u.full_name,
+                        sub.score, sub.max_score, attempts[uid], *task_scores])
         return buf.getvalue()
 
     # ---------- очередь проверки ----------
@@ -380,6 +527,7 @@ class HomeworkService:
             sub = await s.get(Submission, submission_id)
             sub.status = "done"
             sub.score = result.score
+            sub.auto_score = result.score
             sub.max_score = result.max_score
             sub.result = result.to_dict()
             sub.checked_at = utcnow()

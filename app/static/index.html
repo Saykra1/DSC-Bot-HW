@@ -21,6 +21,7 @@
   nav button.active { background: var(--btn); color: var(--btn-text); }
   button { border: 0; border-radius: 8px; padding: 8px 12px; background: var(--card); color: var(--text); font: inherit; cursor: pointer; }
   button.primary { background: var(--btn); color: var(--btn-text); }
+  button.back { background: none; padding: 4px 0; color: var(--link); margin-bottom: 6px; }
   button:disabled { opacity: .5; }
   .card { background: var(--card); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
   .card h3 { margin: 0 0 6px; font-size: 16px; }
@@ -28,10 +29,16 @@
   .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
   .task { border-top: 1px solid rgba(127,127,127,.25); padding-top: 8px; margin-top: 8px; }
   .score { font-weight: 600; }
+  .comment { border-left: 3px solid var(--btn); padding-left: 8px; margin-top: 10px; white-space: pre-wrap; }
   input, textarea { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid rgba(127,127,127,.35); background: var(--bg); color: var(--text); font: inherit; }
+  input.num { width: 64px; }
   label { display: block; margin: 8px 0 4px; font-size: 13px; color: var(--hint); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   td, th { text-align: left; padding: 4px; border-bottom: 1px solid rgba(127,127,127,.2); vertical-align: top; }
+  .scroll { overflow-x: auto; }
+  pre { background: var(--bg); border-radius: 8px; padding: 8px; overflow-x: auto; font-size: 12px; margin: 6px 0; white-space: pre; }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; color: var(--link); }
   .err { color: #d33; }
   ul { margin: 4px 0; padding-left: 18px; }
   a { color: var(--link); }
@@ -52,17 +59,34 @@ const STATUS = { queued: "⏳ в очереди", checking: "🔎 проверя
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (iso) => iso ? new Date(iso).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" }) : "—";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------- запросы ----------
 async function api(path, opts = {}) {
-  const res = await fetch("/api" + path, { ...opts, headers: { ...(opts.headers || {}), "X-Telegram-Init-Data": initData } });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try { detail = (await res.json()).detail || detail; } catch {}
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  const method = (opts.method || "GET").toUpperCase();
+  // GET-запросы повторяем при сетевом сбое (туннель иногда моргает)
+  const tries = method === "GET" ? 3 : 1;
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    let res;
+    try {
+      res = await fetch("/api" + path, { ...opts, headers: { ...(opts.headers || {}), "X-Telegram-Init-Data": initData } });
+    } catch (e) {
+      lastErr = new Error("Нет связи с сервером, попробуй ещё раз");
+      await sleep(600 * (i + 1));
+      continue;
+    }
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail || detail; } catch {}
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+    const ct = res.headers.get("content-type") || "";
+    return ct.includes("application/json") ? res.json() : res.blob();
   }
-  const ct = res.headers.get("content-type") || "";
-  return ct.includes("application/json") ? res.json() : res.blob();
+  throw lastErr;
 }
+const json = (method, body) => ({ method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 function flash(text, isErr = false) {
   $("#msg").innerHTML = text ? `<div class="card ${isErr ? "err" : ""}">${esc(text)}</div>` : "";
@@ -77,26 +101,61 @@ async function download(path, name) {
   } catch (e) { flash(e.message, true); }
 }
 
+// ---------- навигация со стеком и кнопкой «Назад» ----------
+let stack = [];      // [{tab, render}]
+let renderSeq = 0;   // защита от «запоздавших» ответов при быстром переключении
+
+async function show(render, { push = true } = {}) {
+  if (push) stack.push(render);
+  const seq = ++renderSeq;
+  const depth = stack.length;
+  updateBackButton();
+  $("#view").innerHTML = `<p class="hint">Загрузка…</p>`;
+  try {
+    const html = await render();
+    if (seq !== renderSeq) return; // пользователь уже ушёл на другой экран
+    const back = depth > 1 ? `<button class="back" onclick="goBack()">← Назад</button>` : "";
+    $("#view").innerHTML = back + html;
+    render.after?.();
+  } catch (e) {
+    if (seq !== renderSeq) return;
+    $("#view").innerHTML = (depth > 1 ? `<button class="back" onclick="goBack()">← Назад</button>` : "") +
+      `<p class="err">${esc(e.message)}</p><button onclick="reload()">Повторить</button>`;
+  }
+}
+function goBack() { if (stack.length > 1) { stack.pop(); show(stack[stack.length - 1], { push: false }); } }
+function reload() { show(stack[stack.length - 1], { push: false }); }
+function updateBackButton() {
+  if (!tg?.BackButton) return;
+  stack.length > 1 ? tg.BackButton.show() : tg.BackButton.hide();
+}
+tg?.BackButton?.onClick(goBack);
+
 // ---------- задания ----------
-async function showAssignments() {
-  const list = await api("/assignments");
-  if (!list.length) { $("#view").innerHTML = `<p class="hint">Пока нет открытых заданий.</p>`; return; }
-  $("#view").innerHTML = list.map((a) => `
-    <div class="card">
-      <h3>${esc(a.title)} ${a.is_active ? "" : '<span class="hint">(закрыто)</span>'}</h3>
-      ${a.description ? `<div>${esc(a.description)}</div>` : ""}
-      <div class="hint">Заданий: ${a.task_count} · Попытки: ${a.attempts_used}/${a.max_attempts}
-        ${a.deadline ? ` · Дедлайн: ${fmt(a.deadline)}` : ""}
-        ${a.best_score !== null ? ` · Лучший: <span class="score">${a.best_score}/${a.max_score}</span>` : ""}</div>
-      <div class="row">
-        ${ME.bot_enabled ? `<button onclick="sendTemplate(${a.id})">📥 Шаблон в чат</button>` : ""}
-        <button onclick="download('/assignments/${a.id}/template', 'template.ipynb')">Скачать</button>
-      </div>
-      <div class="row">
-        <input type="file" accept=".ipynb" id="file-${a.id}" style="flex:1">
-        <button class="primary" onclick="submitWork(${a.id}, this)">📤 Сдать</button>
-      </div>
-    </div>`).join("");
+function assignmentsView() {
+  return async () => {
+    const list = await api("/assignments");
+    if (!list.length) return `<p class="hint">Пока нет открытых заданий.</p>`;
+    const warn = !ME.is_admin && !ME.profile.fio
+      ? `<div class="card">❗ Укажи ФИО во вкладке <a href="#" onclick="openTab('profile');return false">Профиль</a>, чтобы организаторы засчитали домашки.</div>` : "";
+    return warn + list.map((a) => `
+      <div class="card">
+        <h3>${esc(a.title)} ${a.is_active ? "" : '<span class="hint">(закрыто)</span>'}</h3>
+        ${a.description ? `<div>${esc(a.description)}</div>` : ""}
+        <div class="hint">Заданий: ${a.task_count} · Попытки: ${a.attempts_used}/${a.max_attempts}
+          ${a.deadline ? ` · Дедлайн: ${fmt(a.deadline)}` : ""}
+          ${a.best_score !== null ? ` · Лучший: <span class="score">${a.best_score}/${a.max_score}</span>` : ""}</div>
+        <div class="row">
+          ${ME.bot_enabled ? `<button onclick="sendTemplate(${a.id})">📥 Шаблон в чат</button>` : ""}
+          <button onclick="download('/assignments/${a.id}/template', 'template.ipynb')">Скачать</button>
+          ${a.attempts_used ? `<button onclick="show(mySubsView(${a.id}))">🗂 Мои попытки и отзывы</button>` : ""}
+        </div>
+        <div class="row">
+          <input type="file" accept=".ipynb" id="file-${a.id}" style="flex:1">
+          <button class="primary" onclick="submitWork(${a.id}, this)">📤 Сдать</button>
+        </div>
+      </div>`).join("");
+  };
 }
 
 async function sendTemplate(id) {
@@ -112,135 +171,245 @@ async function submitWork(id, btn) {
   try {
     const sub = await api(`/assignments/${id}/submissions`, { method: "POST", body: fd });
     flash("Работа принята, идёт проверка…");
-    await pollSubmission(sub.id);
+    show(submissionView(sub.id, true));
   } catch (e) { flash(e.message, true); }
   finally { btn.disabled = false; }
 }
 
-async function pollSubmission(id) {
-  showSubmission(id);
-  for (let i = 0; i < 120; i++) {
-    await new Promise((r) => setTimeout(r, 5000));
-    const s = await api(`/submissions/${id}`);
-    if (s.status === "done" || s.status === "error") { showSubmission(id); return; }
-  }
-}
-
 // ---------- сдачи ----------
-async function showMine() {
-  const subs = await api("/submissions");
-  if (!subs.length) { $("#view").innerHTML = `<p class="hint">Сдач пока нет.</p>`; return; }
-  $("#view").innerHTML = `<div class="card"><table>
-    <tr><th>#</th><th>Задание</th><th>Когда</th><th>Итог</th></tr>
-    ${subs.map((s) => `<tr><td><a href="#" onclick="showSubmission(${s.id});return false">${s.id}</a></td>
-      <td>${esc(s.assignment_title)}</td><td>${fmt(s.created_at)}</td>
-      <td>${s.status === "done" ? `<span class="score">${s.score}/${s.max_score}</span>` : STATUS[s.status]}</td></tr>`).join("")}
+function subsTable(subs, withTitle) {
+  return `<div class="scroll"><table>
+    <tr><th>#</th>${withTitle ? "<th>Задание</th>" : ""}<th>Когда</th><th>Итог</th></tr>
+    ${subs.map((s) => `<tr><td><a href="#" onclick="show(submissionView(${s.id}));return false">${s.id}</a></td>
+      ${withTitle ? `<td>${esc(s.assignment_title)}</td>` : ""}<td>${fmt(s.created_at)}</td>
+      <td>${s.status === "done" ? `<span class="score">${s.score}/${s.max_score}</span>${s.organizer_comment ? " 💬" : ""}` : STATUS[s.status]}</td></tr>`).join("")}
   </table></div>`;
 }
 
-async function showSubmission(id) {
-  const s = await api(`/submissions/${id}`);
-  let html = `<div class="card"><h3>${esc(s.assignment_title)} · сдача #${s.id}</h3>
-    ${s.user ? `<div class="hint">${esc(s.user.name)} (id ${s.user.tg_id})</div>` : ""}
-    <div class="hint">${fmt(s.created_at)} · ${STATUS[s.status]}</div>`;
-  if (s.status === "done" && s.result) {
-    const r = s.result;
-    html += `<p class="score">Итог: ${r.score}/${r.max_score}</p><p>${esc(r.summary)}</p>`;
-    for (const t of r.tasks) {
-      html += `<div class="task"><b>${ICON[t.verdict] || ""} Задание ${t.number}. ${esc(t.title)}</b> — <span class="score">${t.score}/10</span>
-        <div>${esc(t.feedback)}</div>
-        ${t.improvements?.length ? `<ul>${t.improvements.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}</div>`;
-    }
-    if (ME.is_admin && r.warnings?.length) html += `<p class="err">${esc(r.warnings.join("; "))}</p>`;
-  } else if (s.status === "error") {
-    html += `<p>Не получилось проверить автоматически, попытка не засчитана.</p>${s.error ? `<p class="err">${esc(s.error)}</p>` : ""}`;
-  } else {
-    html += `<p class="hint">Проверка обычно занимает 1–3 минуты. Отзыв также придёт в чат с ботом.</p>`;
-  }
-  if (ME.is_admin) {
-    html += `<div class="row"><button onclick="recheck(${s.id})">Перепроверить</button>
-      <button onclick="download('/admin/submissions/${s.id}/file', 'submission_${s.id}.ipynb')">Файл участника</button></div>`;
-  }
-  $("#view").innerHTML = html + "</div>";
-}
-
-// ---------- админка ----------
-async function showAdmin() {
-  const list = await api("/assignments");
-  $("#view").innerHTML = `
-    <div class="card"><h3>Новое задание</h3>
-      <form id="new-form">
-        <label>Название</label><input name="title" required>
-        <label>Описание для участников</label><textarea name="description" rows="2"></textarea>
-        <label>Лимит попыток</label><input name="max_attempts" type="number" min="1" placeholder="по умолчанию">
-        <label>Дедлайн (необязательно)</label><input name="deadline" type="datetime-local">
-        <label>Шаблон для участников (.ipynb)</label><input name="template" type="file" accept=".ipynb" required>
-        <label>Эталонное решение (.ipynb)</label><input name="reference" type="file" accept=".ipynb" required>
-        <div class="row"><button class="primary" type="submit">Создать</button></div>
-      </form>
-      <div id="new-result"></div>
-    </div>
-    ${list.map((a) => `<div class="card"><h3>#${a.id} ${esc(a.title)}</h3>
-      <div class="hint">${a.is_active ? "открыто" : "закрыто"} · заданий: ${a.task_count} · попыток: ${a.max_attempts}
-        ${a.deadline ? ` · дедлайн ${fmt(a.deadline)}` : ""}</div>
-      <div class="row">
-        <button onclick="adminSubs(${a.id})">Сдачи</button>
-        <button onclick="download('/admin/assignments/${a.id}/export.csv', 'results_${a.id}.csv')">CSV</button>
-        <button onclick="toggle(${a.id}, ${!a.is_active})">${a.is_active ? "Закрыть приём" : "Открыть приём"}</button>
-      </div></div>`).join("")}`;
-  $("#new-form").onsubmit = async (ev) => {
-    ev.preventDefault();
-    const fd = new FormData(ev.target);
-    if (!fd.get("max_attempts")) fd.delete("max_attempts");
-    const btn = ev.target.querySelector("button"); btn.disabled = true;
-    try {
-      const r = await api("/admin/assignments", { method: "POST", body: fd });
-      $("#new-result").innerHTML = `<p>✅ Создано задание #${r.id}. Найдены задания:</p>
-        <ol>${r.tasks.map((t) => `<li>${esc(t.title)}</li>`).join("")}</ol>
-        ${r.warnings.length ? `<p class="err">${r.warnings.map(esc).join("<br>")}</p>` : ""}`;
-      ev.target.reset();
-    } catch (e) { $("#new-result").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
-    finally { btn.disabled = false; }
+function mySubsView(assignmentId = null) {
+  return async () => {
+    const subs = await api("/submissions" + (assignmentId ? `?assignment_id=${assignmentId}` : ""));
+    if (!subs.length) return `<p class="hint">Сдач пока нет.</p>`;
+    return `<div class="card">${assignmentId ? `<h3>${esc(subs[0].assignment_title)}</h3>` : ""}
+      <div class="hint">Нажми на номер, чтобы открыть отзыв.</div>${subsTable(subs, !assignmentId)}</div>`;
   };
 }
 
-async function toggle(id, active) {
-  const fd = new FormData(); fd.append("is_active", active);
-  try { await api(`/admin/assignments/${id}`, { method: "PATCH", body: fd }); showAdmin(); }
-  catch (e) { flash(e.message, true); }
+function taskBlock(t) {
+  const edited = t.auto_score !== null && t.auto_score !== undefined ? ` <span class="hint">(изменено организатором, было ${t.auto_score})</span>` : "";
+  return `<div class="task"><b>${ICON[t.verdict] || ""} Задание ${t.number}. ${esc(t.title)}</b> — <span class="score">${t.score}/10</span>${edited}
+    <div>${esc(t.feedback)}</div>
+    ${t.improvements?.length ? `<ul>${t.improvements.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}</div>`;
 }
 
-async function adminSubs(id) {
-  const subs = await api(`/admin/assignments/${id}/submissions`);
-  $("#view").innerHTML = `<div class="card"><h3>Сдачи по заданию #${id}</h3>
-    <div class="row"><button onclick="showAdmin()">← Назад</button></div>
-    ${subs.length ? `<table><tr><th>#</th><th>Участник</th><th>Когда</th><th>Итог</th></tr>
-      ${subs.map((s) => `<tr><td><a href="#" onclick="showSubmission(${s.id});return false">${s.id}</a></td>
-        <td>${esc(s.user?.name)}</td><td>${fmt(s.created_at)}</td>
-        <td>${s.status === "done" ? `${s.score}/${s.max_score}` : STATUS[s.status]}</td></tr>`).join("")}</table>`
-      : `<p class="hint">Сдач пока нет.</p>`}</div>`;
+function submissionView(id, poll = false) {
+  const render = async () => {
+    let s = await api(`/submissions/${id}`);
+    if (poll) {
+      // ждём окончания проверки, но экран не блокируем дольше ~10 минут
+      for (let i = 0; i < 120 && (s.status === "queued" || s.status === "checking"); i++) {
+        if (i === 0) $("#view").innerHTML = `<p class="hint">Проверяем работу… обычно 1–3 минуты. Отзыв также придёт в чат с ботом.</p>`;
+        await sleep(5000);
+        s = await api(`/submissions/${id}`);
+      }
+    }
+    let html = `<div class="card"><h3>${esc(s.assignment_title)} · сдача #${s.id}</h3>
+      ${s.user ? `<div>${esc(s.user.name)}${s.user.fio ? " · " + esc(s.user.fio) : ' · <span class="err">ФИО не указано</span>'}${s.user.username ? " · @" + esc(s.user.username) : ""} <span class="hint">(id ${s.user.tg_id})</span></div>` : ""}
+      <div class="hint">${fmt(s.created_at)} · ${STATUS[s.status]}</div>`;
+    if (s.status === "done" && s.result) {
+      const r = s.result;
+      const edited = s.auto_score !== null && s.auto_score !== s.score ? ` <span class="hint">(агент поставил ${s.auto_score})</span>` : "";
+      html += `<p class="score">Итог: ${r.score}/${r.max_score}${edited}</p><p>${esc(r.summary)}</p>`;
+      html += r.tasks.map(taskBlock).join("");
+      if (s.organizer_comment) html += `<div class="comment"><b>💬 Комментарий организатора</b>\n${esc(s.organizer_comment)}</div>`;
+      if (ME.is_admin && r.warnings?.length) html += `<p class="err">${esc(r.warnings.join("; "))}</p>`;
+    } else if (s.status === "error") {
+      html += `<p>Не получилось проверить автоматически, попытка не засчитана.</p>${s.error ? `<p class="err">${esc(s.error)}</p>` : ""}`;
+    } else {
+      html += `<p class="hint">Проверка ещё идёт. Отзыв придёт в чат с ботом.</p>`;
+    }
+    html += "</div>";
+    if (ME.is_admin) html += await adminSubmissionTools(s);
+    return html;
+  };
+  render.after = () => { const f = $("#review-form"); if (f) f.onsubmit = (ev) => saveReview(ev, id); };
+  return render;
+}
+
+// ---------- организаторам: код, оценка, комментарий ----------
+async function adminSubmissionTools(s) {
+  let html = `<div class="card"><h3>Код участника</h3>`;
+  try {
+    const code = await api(`/admin/submissions/${s.id}/code`);
+    html += code.tasks.map((t) => `<div class="task"><b>Задание ${t.number}. ${esc(t.title)}</b>
+        <pre>${esc(t.code || "(пусто)")}</pre>
+        <details><summary>Эталон</summary><pre>${esc(t.reference || "(нет)")}</pre></details></div>`).join("");
+    html += `<details><summary>Весь ноутбук (${code.cells.length} ячеек)</summary>
+      ${code.cells.map((c) => c.type === "code" ? `<pre>${esc(c.source)}</pre>` : `<div class="hint" style="white-space:pre-wrap;margin:6px 0">${esc(c.source)}</div>`).join("")}</details>`;
+  } catch (e) { html += `<p class="err">${esc(e.message)}</p>`; }
+  html += `<div class="row"><button onclick="download('/admin/submissions/${s.id}/file', 'submission_${s.id}.ipynb')">Скачать файл</button>
+    <button onclick="recheck(${s.id})">Перепроверить агентом</button></div></div>`;
+
+  if (s.status === "done" && s.result) {
+    html += `<div class="card"><h3>Оценка и комментарий организатора</h3>
+      <form id="review-form">
+        ${s.result.tasks.map((t) => `<div class="row"><input class="num" type="number" min="0" max="10" name="t${t.number}" value="${t.score}">
+          <span>Задание ${t.number}. ${esc(t.title)}</span></div>`).join("")}
+        <label>Комментарий участнику (придёт в чат с ботом)</label>
+        <textarea name="comment" rows="3">${esc(s.organizer_comment || "")}</textarea>
+        <div class="row"><button class="primary" type="submit">Сохранить и уведомить участника</button></div>
+      </form></div>`;
+  }
+  return html;
+}
+
+async function saveReview(ev, id) {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const task_scores = {};
+  for (const [k, v] of fd.entries()) if (k.startsWith("t")) task_scores[k.slice(1)] = Number(v);
+  const btn = ev.target.querySelector("button"); btn.disabled = true;
+  try {
+    await api(`/admin/submissions/${id}/review`, json("PATCH", { task_scores, comment: fd.get("comment") }));
+    flash("Сохранено, участник получил уведомление");
+    reload();
+  } catch (e) { flash(e.message, true); btn.disabled = false; }
 }
 
 async function recheck(id) {
-  try { await api(`/admin/submissions/${id}/recheck`, { method: "POST" }); flash("Отправлено на перепроверку"); pollSubmission(id); }
+  try {
+    await api(`/admin/submissions/${id}/recheck`, { method: "POST" });
+    flash("Отправлено на перепроверку");
+    stack[stack.length - 1] = submissionView(id, true);
+    reload();
+  }
   catch (e) { flash(e.message, true); }
 }
 
-// ---------- навигация ----------
-const TABS = [["assignments", "Задания", showAssignments], ["mine", "Мои сдачи", showMine]];
-function renderNav(active) {
-  const tabs = ME.is_admin ? [...TABS, ["admin", "Организаторам", showAdmin]] : TABS;
-  $("#nav").innerHTML = tabs.map(([k, label]) => `<button class="${k === active ? "active" : ""}" data-tab="${k}">${label}</button>`).join("");
-  $("#nav").querySelectorAll("button").forEach((b) => b.onclick = () => go(b.dataset.tab));
+// ---------- организаторам: задания ----------
+function adminView() {
+  const render = async () => {
+    const list = await api("/assignments");
+    return `
+      <div class="card"><h3>Новое задание</h3>
+        <form id="new-form">
+          <label>Название</label><input name="title" required>
+          <label>Описание для участников</label><textarea name="description" rows="2"></textarea>
+          <label>Лимит попыток</label><input name="max_attempts" type="number" min="1" placeholder="по умолчанию">
+          <label>Дедлайн (необязательно)</label><input name="deadline" type="datetime-local">
+          <label>Шаблон для участников (.ipynb)</label><input name="template" type="file" accept=".ipynb" required>
+          <label>Эталонное решение (.ipynb)</label><input name="reference" type="file" accept=".ipynb" required>
+          <div class="row"><button class="primary" type="submit">Создать</button></div>
+        </form>
+        <div id="new-result"></div>
+      </div>
+      ${list.map((a) => `<div class="card"><h3>#${a.id} ${esc(a.title)}</h3>
+        <div class="hint">${a.is_active ? "открыто" : "закрыто"} · заданий: ${a.task_count} · попыток: ${a.max_attempts}
+          ${a.deadline ? ` · дедлайн ${fmt(a.deadline)}` : ""}</div>
+        <div class="row">
+          <button onclick="show(adminSubsView(${a.id}))">Сдачи</button>
+          <button onclick="download('/admin/assignments/${a.id}/export.csv', 'results_${a.id}.csv')">CSV</button>
+          <button onclick="toggle(${a.id}, ${!a.is_active})">${a.is_active ? "Закрыть приём" : "Открыть приём"}</button>
+        </div></div>`).join("")}`;
+  };
+  render.after = () => {
+    $("#new-form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      if (!fd.get("max_attempts")) fd.delete("max_attempts");
+      const btn = ev.target.querySelector("button"); btn.disabled = true;
+      try {
+        const r = await api("/admin/assignments", { method: "POST", body: fd });
+        $("#new-result").innerHTML = `<p>✅ Создано задание #${r.id}. Найдены задания:</p>
+          <ol>${r.tasks.map((t) => `<li>${esc(t.title)}</li>`).join("")}</ol>
+          ${r.warnings.length ? `<p class="err">${r.warnings.map(esc).join("<br>")}</p>` : ""}`;
+        ev.target.reset();
+      } catch (e) { $("#new-result").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+      finally { btn.disabled = false; }
+    };
+  };
+  return render;
 }
-async function go(tab) {
-  const all = ME.is_admin ? [...TABS, ["admin", "", showAdmin]] : TABS;
-  renderNav(tab);
-  try { await all.find((t) => t[0] === tab)[2](); } catch (e) { $("#view").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+
+async function toggle(id, active) {
+  try { await api(`/admin/assignments/${id}`, json("PATCH", { is_active: active })); reload(); }
+  catch (e) { flash(e.message, true); }
+}
+
+function adminSubsView(id) {
+  return async () => {
+    const subs = await api(`/admin/assignments/${id}/submissions`);
+    return `<div class="card"><h3>Сдачи по заданию #${id}</h3>
+      ${subs.length ? `<div class="scroll"><table><tr><th>#</th><th>Участник</th><th>ФИО</th><th>Когда</th><th>Итог</th></tr>
+        ${subs.map((s) => `<tr><td><a href="#" onclick="show(submissionView(${s.id}));return false">${s.id}</a></td>
+          <td>${esc(s.user?.name)}${s.user?.username ? `<div class="hint">@${esc(s.user.username)}</div>` : ""}</td>
+          <td>${s.user?.fio ? esc(s.user.fio) : '<span class="hint">—</span>'}</td>
+          <td>${fmt(s.created_at)}</td>
+          <td>${s.status === "done" ? `${s.score}/${s.max_score}${s.edited_at ? " ✏️" : ""}${s.organizer_comment ? " 💬" : ""}` : STATUS[s.status]}</td></tr>`).join("")}</table></div>`
+        : `<p class="hint">Сдач пока нет.</p>`}</div>`;
+  };
+}
+
+// ---------- организаторам: участники ----------
+function participantsView() {
+  return async () => {
+    const data = await api("/admin/participants");
+    if (!data.participants.length) return `<p class="hint">Участников пока нет.</p>`;
+    const head = data.assignments.map((a) => `<th>${esc(a.title)}</th>`).join("");
+    const rows = data.participants.map((p) => `<tr>
+      <td>${esc(p.name)}${p.username ? `<div class="hint">@${esc(p.username)}</div>` : ""}</td>
+      <td>${p.fio ? esc(p.fio) : '<span class="err">не указано</span>'}</td>
+      ${data.assignments.map((a) => { const x = p.assignments[a.id]; return `<td>${x ? `${x.best_score}/${x.max_score}` : '<span class="hint">—</span>'}</td>`; }).join("")}
+    </tr>`).join("");
+    return `<div class="card"><h3>Участники (${data.participants.length})</h3>
+      <div class="hint">Лучший результат по каждому заданию, «—» — не сдавал.</div>
+      <div class="scroll"><table><tr><th>Ник</th><th>ФИО</th>${head}</tr>${rows}</table></div></div>`;
+  };
+}
+
+// ---------- профиль ----------
+function profileView() {
+  const render = async () => {
+    const me = await api("/me"); ME = me;
+    const p = me.profile;
+    return `<div class="card"><h3>Профиль</h3>
+      <div class="hint">Telegram: ${esc(p.tg_name)}${p.username ? " (@" + esc(p.username) + ")" : ""}</div>
+      <form id="profile-form">
+        <label>Ник в боте (как тебя видят другие)</label>
+        <input name="nickname" maxlength="40" value="${esc(p.nickname || "")}" placeholder="${esc(p.tg_name)}">
+        <label>ФИО (видят только организаторы, нужно для зачёта)</label>
+        <input name="fio" maxlength="150" value="${esc(p.fio || "")}" placeholder="Иванов Иван Иванович">
+        <div class="row"><button class="primary" type="submit">Сохранить</button></div>
+      </form></div>`;
+  };
+  render.after = () => {
+    $("#profile-form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      try {
+        ME.profile = await api("/profile", json("PATCH", { nickname: fd.get("nickname"), fio: fd.get("fio") }));
+        flash("Сохранено");
+      } catch (e) { flash(e.message, true); }
+    };
+  };
+  return render;
+}
+
+// ---------- вкладки ----------
+function tabs() {
+  const t = [["assignments", "Задания", assignmentsView], ["mine", "Мои сдачи", () => mySubsView()], ["profile", "Профиль", profileView]];
+  if (ME.is_admin) t.push(["admin", "Организаторам", adminView], ["people", "Участники", participantsView]);
+  return t;
+}
+function openTab(key) {
+  const tab = tabs().find((t) => t[0] === key);
+  $("#nav").innerHTML = tabs().map(([k, label]) => `<button class="${k === key ? "active" : ""}" onclick="openTab('${k}')">${label}</button>`).join("");
+  stack = [];
+  show(tab[2]());
 }
 
 (async () => {
-  try { ME = await api("/me"); go("assignments"); }
+  try { ME = await api("/me"); openTab("assignments"); }
   catch (e) { $("#view").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 })();
 </script>

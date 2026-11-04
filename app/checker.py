@@ -38,6 +38,7 @@ class TaskResult:
     feedback: str
     improvements: list[str] = field(default_factory=list)
     auto: bool = False  # оценено без LLM (не сделано / совпадает с эталоном)
+    auto_score: int | None = None  # исходная оценка агента, если организатор её изменил
 
 
 @dataclass
@@ -149,7 +150,7 @@ def build_user_prompt(items: list[tuple[TaskMatch, str, str | None]], assignment
     return "\n".join(parts)
 
 
-def _verdict_for(score: int) -> Verdict:
+def verdict_for(score: int) -> Verdict:
     if score >= 7:
         return "correct"
     if score >= 4:
@@ -220,7 +221,7 @@ async def check_submission(
                 number=t.number,
                 title=t.title,
                 score=score,
-                verdict=_verdict_for(score),
+                verdict=verdict_for(score),
                 feedback=str(item.get("feedback", "")).strip(),
                 improvements=[str(x).strip() for x in improvements if str(x).strip()][:3],
             )

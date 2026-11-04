@@ -123,3 +123,39 @@ async def test_admin_creates_assignment_and_student_submits(env):
     # шаблон отправляется документом
     await press(STUDENT, f"tpl:{a.id}")
     assert any(isinstance(r, SendDocument) for r in session.requests)
+
+
+async def test_profile_and_admin_review_commands(env):
+    service, session, send, press = env
+    await send(STUDENT, "/start")
+    assert "Укажи ФИО" in session.texts()[-1]
+    await send(STUDENT, "/fio Иванов")
+    assert "❌" in session.texts()[-1]
+    await send(STUDENT, "/fio Иванов Иван Иванович")
+    await send(STUDENT, "/name Кот")
+    await send(STUDENT, "/profile")
+    assert "Кот" in session.texts()[-1] and "Иванов Иван Иванович" in session.texts()[-1]
+
+    a, _ = await service.create_assignment("ДЗ", "", TEMPLATE, REFERENCE)
+    sub = await service.submit(STUDENT, a.id, make_student({14: "x = 1\n"}), "hw.ipynb")
+    await service.process(sub.id)
+
+    n = len(session.requests)
+    await send(STUDENT, f"/score {sub.id} 1=10")  # не организатор — молчим
+    assert len(session.requests) == n
+
+    sent = []
+
+    async def notifier(tg_id, messages):
+        sent.append((tg_id, messages))
+
+    service.notifier = notifier
+    await send(ADMIN, f"/score {sub.id} 1=10")
+    assert "10/20" in session.texts()[-1]
+    await send(ADMIN, f"/comment {sub.id} Отлично!")
+    assert [tg for tg, _ in sent] == [STUDENT, STUDENT]
+    assert "8/20 → 10/20" in sent[0][1][0] and "Отлично!" in sent[1][1][0]
+
+    await send(ADMIN, f"/sub {sub.id}")
+    texts = "\n".join(session.texts()[-4:])
+    assert "Кот" in texts and "Иванов Иван Иванович" in texts and "Комментарий организатора" in texts
