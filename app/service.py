@@ -17,6 +17,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm import selectinload
 
+from app import quiz as qz
 from app.checker import (
     MAX_TASK_SCORE,
     CheckResult,
@@ -42,15 +43,51 @@ class ServiceError(Exception):
     """Ошибка, текст которой можно показать пользователю."""
 
 
+def has_notebook(a: Assignment) -> bool:
+    return bool(a.template_path)
+
+
+def notebook_max(a: Assignment) -> int:
+    return a.task_count * 10 if has_notebook(a) else 0
+
+
+def quiz_max(a: Assignment) -> int:
+    return qz.total_points(a.quiz)
+
+
+def total_max(a: Assignment) -> int:
+    return notebook_max(a) + quiz_max(a)
+
+
+def quiz_attempts(a: Assignment) -> int:
+    return int((a.quiz or {}).get("attempts") or qz.DEFAULT_ATTEMPTS)
+
+
+def combine(nb: int | None, qu: int | None) -> int | None:
+    """Итог задания: лучший ноутбук + лучший тест (None — ничего не сдано)."""
+    if nb is None and qu is None:
+        return None
+    return (nb or 0) + (qu or 0)
+
+
+# Тип сдачи: у старых записей kind пустой — это ноутбук
+KIND = func.coalesce(Submission.kind, "notebook")
+
+
 @dataclass
 class AssignmentView:
     assignment: Assignment
-    attempts_used: int
-    best_score: int | None
+    attempts_used: int  # попытки ноутбука
+    best_score: int | None  # итог: лучший ноутбук + лучший тест
     max_score: int
+    notebook_best: int | None = None
+    quiz_best: int | None = None
+    quiz_attempts_used: int = 0
 
     def to_dict(self, tz) -> dict:
         a = self.assignment
+        nb = has_notebook(a)
+        quiz = a.quiz or None
         return {
             "id": a.id,
             "title": a.title,
@@ -65,6 +102,15 @@ class AssignmentView:
             "publish_at": as_utc(a.publish_at).isoformat() if a.publish_at else None,
             "published": is_published(a),
             "reference_available": reference_available(a),
+            "parts": (["quiz"] if quiz else []) + (["notebook"] if nb else []),
+            "notebook": {
+                "task_count": a.task_count, "max_score": notebook_max(a), "best_score": self.notebook_best,
+                "attempts_used": self.attempts_used, "max_attempts": a.max_attempts,
+            } if nb else None,
+            "quiz": {
+                "questions": len(quiz["questions"]), "max_score": quiz_max(a), "best_score": self.quiz_best,
+                "attempts_used": self.quiz_attempts_used, "max_attempts": quiz_attempts(a),
+            } if quiz else None,
         }
 
 
@@ -112,6 +158,7 @@ class DbGradeCache:
 def submission_to_dict(s: Submission, include_user: bool = False) -> dict:
     d = {
         "id": s.id,
+        "kind": s.kind or "notebook",
         "attempt": getattr(s, "attempt", None),  # номер попытки участника по этому заданию (None — не засчитана)
         "assignment_id": s.assignment_id,
         "status": s.status,
@@ -225,11 +272,13 @@ class HomeworkService:
             assignments = list((await s.scalars(select(Assignment).order_by(Assignment.id))).all())
             users = list((await s.scalars(select(User).order_by(User.created_at))).all())
             rows = await s.execute(
-                select(Submission.user_id, Submission.assignment_id, func.max(Submission.score), func.count(Submission.id))
+                select(Submission.user_id, Submission.assignment_id, KIND, func.max(Submission.score), func.count(Submission.id))
                 .where(Submission.status == "done")
-                .group_by(Submission.user_id, Submission.assignment_id)
+                .group_by(Submission.user_id, Submission.assignment_id, KIND)
             )
-            best: dict[tuple[int, int], tuple[int, int]] = {(u, a): (sc, n) for u, a, sc, n in rows}
+            best: dict[tuple[int, int], dict[str, tuple[int, int]]] = {}
+            for u, a, kind, sc, n in rows:
+                best.setdefault((u, a), {})[kind] = (sc, n)
         result = []
         for u in users:
             if self.is_admin(u.tg_id):
@@ -237,8 +286,13 @@ class HomeworkService:
             per = {}
             for a in assignments:
                 if (u.tg_id, a.id) in best:
-                    sc, n = best[(u.tg_id, a.id)]
-                    per[str(a.id)] = {"best_score": sc, "max_score": a.task_count * 10, "attempts": n}
+                    by_kind = best[(u.tg_id, a.id)]
+                    nb = by_kind.get("notebook", (None, 0))
+                    qu = by_kind.get("quiz", (None, 0))
+                    per[str(a.id)] = {
+                        "best_score": combine(nb[0], qu[0]), "max_score": total_max(a), "attempts": nb[1] + qu[1],
+                        "notebook_score": nb[0], "quiz_score": qu[0],
+                    }
             result.append(u.to_dict() | {"assignments": per})
         return assignments, result
 
@@ -248,26 +302,35 @@ class HomeworkService:
         self,
         title: str,
         description: str,
-        template_raw: bytes,
-        reference_raw: bytes,
+        template_raw: bytes | None,
+        reference_raw: bytes | None,
         max_attempts: int | None = None,
         deadline: datetime | None = None,
         publish_at: datetime | None = None,
+        quiz: dict | None = None,
     ) -> tuple[Assignment, list[str]]:
+        """Задание из ноутбучной части (шаблон + эталон), теста или обеих."""
         title = (title or "").strip()
         if not title:
             raise ServiceError("Укажите название задания")
-        try:
-            prepared = prepare_assignment(template_raw, reference_raw, self.settings.task_markers)
-        except NotebookError as e:
-            raise ServiceError(str(e)) from e
-
-        folder = self.files_dir / "assignments" / uuid.uuid4().hex
-        folder.mkdir(parents=True, exist_ok=True)
-        tpl_path = folder / "template.ipynb"
-        ref_path = folder / "reference.ipynb"
-        tpl_path.write_bytes(strip_outputs(template_raw))
-        ref_path.write_bytes(reference_raw)
+        quiz = self._check_quiz(quiz)
+        if bool(template_raw) != bool(reference_raw):
+            raise ServiceError("Для ноутбука нужны оба файла: шаблон и эталон")
+        if not template_raw and not quiz:
+            raise ServiceError("Добавь тест или ноутбук: задание не может быть пустым")
+        prepared = None
+        tpl_path = ref_path = ""
+        if template_raw:
+            try:
+                prepared = prepare_assignment(template_raw, reference_raw, self.settings.task_markers)
+            except NotebookError as e:
+                raise ServiceError(str(e)) from e
+            folder = self.files_dir / "assignments" / uuid.uuid4().hex
+            folder.mkdir(parents=True, exist_ok=True)
+            tpl_path = folder / "template.ipynb"
+            ref_path = folder / "reference.ipynb"
+            tpl_path.write_bytes(strip_outputs(template_raw))
+            ref_path.write_bytes(reference_raw)
 
         async with self.sm() as s:
             a = Assignment(
@@ -275,7 +338,8 @@ class HomeworkService:
                 description=(description or "").strip(),
                 template_path=str(tpl_path),
                 reference_path=str(ref_path),
-                task_count=len(prepared.tasks),
+                task_count=len(prepared.tasks) if prepared else 0,
+                quiz=quiz,
                 max_attempts=max_attempts or self.settings.default_max_attempts,
                 deadline=deadline,
                 publish_at=publish_at,
@@ -284,10 +348,18 @@ class HomeworkService:
             )
             s.add(a)
             await s.commit()
-        self._prepared[a.id] = prepared
+        if prepared:
+            self._prepared[a.id] = prepared
         if publish_at is None:
             self.spawn(self.announce_due())
-        return a, prepared.warnings
+        return a, prepared.warnings if prepared else []
+
+    @staticmethod
+    def _check_quiz(quiz: dict | None) -> dict | None:
+        try:
+            return qz.normalize_quiz(quiz)
+        except qz.QuizError as e:
+            raise ServiceError(str(e)) from e
 
     async def update_assignment(
         self,
@@ -300,13 +372,28 @@ class HomeworkService:
         publish_at: datetime | None | bool = False,
         template_raw: bytes | None = None,
         reference_raw: bytes | None = None,
+        quiz: dict | None | bool = False,  # False — не менять, None — убрать тест
     ) -> tuple[Assignment, list[str]]:
-        """Правка задания организатором. Если меняются файлы, кэш оценок сбрасывается."""
+        """Правка задания организатором. Если меняются файлы, кэш оценок сбрасывается.
+
+        После правки теста попытки пересчитываются по новому ключу (ручные оценки организатора сохраняются).
+        """
         warnings: list[str] = []
+        if quiz is not False:
+            quiz = self._check_quiz(quiz)
         async with self.sm() as s:
             a = await s.get(Assignment, assignment_id)
             if a is None:
                 raise ServiceError("Задание не найдено")
+            if quiz is None and not has_notebook(a) and not template_raw:
+                raise ServiceError("Нельзя убрать тест: в задании больше ничего нет")
+            if (template_raw is not None or reference_raw is not None) and not has_notebook(a):
+                if not (template_raw and reference_raw):
+                    raise ServiceError("Чтобы добавить ноутбук, нужны оба файла: шаблон и эталон")
+                folder = self.files_dir / "assignments" / uuid.uuid4().hex
+                folder.mkdir(parents=True, exist_ok=True)
+                a.template_path = str(folder / "template.ipynb")
+                a.reference_path = str(folder / "reference.ipynb")
             if template_raw is not None or reference_raw is not None:
                 tpl = template_raw if template_raw is not None else Path(a.template_path).read_bytes()
                 ref = reference_raw if reference_raw is not None else Path(a.reference_path).read_bytes()
@@ -336,15 +423,33 @@ class HomeworkService:
                 a.deadline = deadline
             if publish_at is not False:
                 a.publish_at = publish_at
+            if quiz is not False:
+                a.quiz = quiz
+                if quiz:
+                    await self._regrade_quiz(s, a)
             await s.commit()
         self.spawn(self.announce_due())
         return a, warnings
+
+    @staticmethod
+    async def _regrade_quiz(s, a: Assignment) -> int:
+        subs = (await s.scalars(select(Submission).where(Submission.assignment_id == a.id, Submission.kind == "quiz"))).all()
+        for sub in subs:
+            if not sub.result:
+                continue
+            result = qz.regrade(dict(sub.result), a.quiz)
+            sub.result = result
+            sub.score = result["score"]
+            sub.max_score = result["max_score"]
+        return len(subs)
 
     async def recheck_all(self, assignment_id: int) -> int:
         """Перепроверить все проверенные сдачи задания (например, после исправления эталона)."""
         async with self.sm() as s:
             ids = list((await s.scalars(
-                select(Submission.id).where(Submission.assignment_id == assignment_id, Submission.status.in_(["done", "error"]))
+                select(Submission.id).where(
+                    Submission.assignment_id == assignment_id, Submission.status.in_(["done", "error"]), KIND == "notebook"
+                )
             )).all())
         for sid in ids:
             try:
@@ -377,33 +482,44 @@ class HomeworkService:
             assignments = list((await s.scalars(q)).all())
             if not include_inactive:
                 assignments = [a for a in assignments if is_published(a)]
-            stats = {}
+            stats: dict[tuple[int, str], tuple[int, int | None]] = {}
             rows = await s.execute(
-                select(Submission.assignment_id, func.count(Submission.id), func.max(Submission.score))
+                select(Submission.assignment_id, KIND, func.count(Submission.id), func.max(Submission.score))
                 .where(Submission.user_id == user_id, Submission.status != "error")
-                .group_by(Submission.assignment_id)
+                .group_by(Submission.assignment_id, KIND)
             )
-            for aid, cnt, best in rows:
-                stats[aid] = (cnt, best)
-        return [
-            AssignmentView(a, stats.get(a.id, (0, None))[0], stats.get(a.id, (0, None))[1], a.task_count * 10)
-            for a in assignments
-        ]
+            for aid, kind, cnt, best in rows:
+                stats[(aid, kind)] = (cnt, best)
+        views = []
+        for a in assignments:
+            nb_cnt, nb_best = stats.get((a.id, "notebook"), (0, None))
+            q_cnt, q_best = stats.get((a.id, "quiz"), (0, None))
+            views.append(AssignmentView(
+                a, nb_cnt, combine(nb_best, q_best), total_max(a),
+                notebook_best=nb_best, quiz_best=q_best, quiz_attempts_used=q_cnt,
+            ))
+        return views
 
     async def template_bytes(self, assignment_id: int, user_id: int | None = None) -> tuple[str, bytes]:
         a = await self.get_assignment(assignment_id)
+        if not has_notebook(a):
+            raise ServiceError("В этом задании нет ноутбука")
         if user_id is not None and not self.is_admin(user_id) and not is_published(a):
             raise ServiceError("Задание ещё не опубликовано")
         return f"{_safe_name(a.title)}.ipynb", Path(a.template_path).read_bytes()
 
     async def reference_bytes(self, assignment_id: int, user_id: int) -> tuple[str, bytes]:
         a = await self.get_assignment(assignment_id)
+        if not has_notebook(a):
+            raise ServiceError("В этом задании нет ноутбука")
         if not self.is_admin(user_id) and not reference_available(a):
             raise ServiceError("Эталон откроется после дедлайна")
         return f"{_safe_name(a.title)}_эталон.ipynb", Path(a.reference_path).read_bytes()
 
     async def reference_tasks(self, assignment_id: int, user_id: int) -> list[dict]:
         a = await self.get_assignment(assignment_id)
+        if not has_notebook(a):
+            raise ServiceError("В этом задании нет ноутбука")
         if not self.is_admin(user_id) and not reference_available(a):
             raise ServiceError("Эталон откроется после дедлайна")
         prepared = await self._get_prepared(a)
@@ -433,19 +549,15 @@ class HomeworkService:
 
         async with self.sm() as s:
             a = await s.get(Assignment, assignment_id)
-            if a is None:
-                raise ServiceError("Задание не найдено")
-            if not a.is_active:
-                raise ServiceError("Приём работ по этому заданию закрыт")
-            if not is_published(a) and not self.is_admin(user_id):
-                raise ServiceError("Задание ещё не опубликовано")
-            if a.deadline and utcnow() > as_utc(a.deadline):
-                raise ServiceError("Дедлайн по этому заданию уже прошёл")
+            self._check_open(a, user_id)
+            if not has_notebook(a):
+                raise ServiceError("В этом задании нет ноутбука: только тест в мини аппе")
             used = await s.scalar(
                 select(func.count(Submission.id)).where(
                     Submission.user_id == user_id,
                     Submission.assignment_id == assignment_id,
                     Submission.status != "error",
+                    KIND == "notebook",
                 )
             )
             if not self.is_admin(user_id) and used >= a.max_attempts:
@@ -464,11 +576,75 @@ class HomeworkService:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(raw)
             sub = Submission(
-                assignment_id=assignment_id, user_id=user_id, file_path=str(path), file_name=file_name[:256], status="queued"
+                assignment_id=assignment_id, user_id=user_id, file_path=str(path), file_name=file_name[:256],
+                status="queued", kind="notebook",
             )
             s.add(sub)
             await s.commit()
         await self._queue.put(sub.id)
+        return sub
+
+    def _check_open(self, a: Assignment | None, user_id: int) -> None:
+        if a is None:
+            raise ServiceError("Задание не найдено")
+        if not a.is_active:
+            raise ServiceError("Приём работ по этому заданию закрыт")
+        if not is_published(a) and not self.is_admin(user_id):
+            raise ServiceError("Задание ещё не опубликовано")
+        if a.deadline and utcnow() > as_utc(a.deadline):
+            raise ServiceError("Дедлайн по этому заданию уже прошёл")
+
+    # ---------- тест ----------
+
+    async def quiz_for(self, assignment_id: int, user_id: int) -> dict:
+        """Тест для участника: вопросы без ответов (после дедлайна — с ответами), попытки."""
+        a = await self.get_assignment(assignment_id)
+        admin = self.is_admin(user_id)
+        if not a.quiz:
+            raise ServiceError("В этом задании нет теста")
+        if not admin and (not a.is_active or not is_published(a)):
+            raise ServiceError("Задание недоступно")
+        reveal = admin or reference_available(a)
+        async with self.sm() as s:
+            used = await s.scalar(select(func.count(Submission.id)).where(
+                Submission.user_id == user_id, Submission.assignment_id == a.id, Submission.kind == "quiz"))
+        questions = []
+        for n, q in enumerate(a.quiz["questions"], 1):
+            item = qz.public_question(q, n)
+            if reveal:
+                item |= qz.key_of(q)
+            questions.append(item)
+        return {
+            "assignment_id": a.id, "title": a.title, "questions": questions,
+            "max_score": quiz_max(a), "max_attempts": quiz_attempts(a), "attempts_used": used or 0,
+            "keys_visible": reveal, "deadline": as_utc(a.deadline).isoformat() if a.deadline else None,
+        }
+
+    async def quiz_full(self, assignment_id: int) -> dict:
+        """Тест целиком (с ключом) — для конструктора организатора."""
+        a = await self.get_assignment(assignment_id)
+        return a.quiz or {"attempts": qz.DEFAULT_ATTEMPTS, "questions": []}
+
+    async def submit_quiz(self, user_id: int, assignment_id: int, answers: dict) -> Submission:
+        async with self.sm() as s:
+            a = await s.get(Assignment, assignment_id)
+            self._check_open(a, user_id)
+            if not a.quiz:
+                raise ServiceError("В этом задании нет теста")
+            used = await s.scalar(select(func.count(Submission.id)).where(
+                Submission.user_id == user_id, Submission.assignment_id == assignment_id, Submission.kind == "quiz"))
+            limit = quiz_attempts(a)
+            if not self.is_admin(user_id) and used >= limit:
+                raise ServiceError(f"Попытки закончились ({limit} из {limit})")
+            result = qz.grade(a.quiz, answers)
+            now = utcnow()
+            sub = Submission(
+                assignment_id=assignment_id, user_id=user_id, kind="quiz", file_path="", file_name="",
+                status="done", score=result["score"], max_score=result["max_score"], result=result, checked_at=now,
+            )
+            s.add(sub)
+            await s.commit()
+        sub.attempt = (used or 0) + 1
         return sub
 
     @staticmethod
@@ -476,7 +652,7 @@ class HomeworkService:
         """Проставляет sub.attempt: номер попытки участника по заданию (ошибки проверки не считаются)."""
         counters: dict[tuple[int, int], int] = {}
         for sub in sorted(subs, key=lambda x: x.id):
-            key = (sub.user_id, sub.assignment_id)
+            key = (sub.user_id, sub.assignment_id, sub.kind or "notebook")
             if sub.status == "error":
                 sub.attempt = None
                 continue
@@ -492,6 +668,7 @@ class HomeworkService:
                     Submission.assignment_id == submission.assignment_id,
                     Submission.id <= submission.id,
                     Submission.status != "error",
+                    KIND == (submission.kind or "notebook"),
                 )
             ) or 1
 
@@ -530,6 +707,8 @@ class HomeworkService:
             sub = await s.get(Submission, submission_id)
             if sub is None:
                 raise ServiceError("Сдача не найдена")
+            if sub.kind == "quiz":
+                raise ServiceError("Тест проверяется сразу, перепроверять нечего")
             if sub.status in ("queued", "checking"):
                 raise ServiceError("Сдача уже в очереди")
             sub.status = "queued"
@@ -559,6 +738,12 @@ class HomeworkService:
             if sub.status != "done" or not sub.result:
                 raise ServiceError("Менять оценку можно только у проверенной работы")
             a = await s.get(Assignment, sub.assignment_id)
+            if sub.kind == "quiz":
+                changes, old_total = self._review_quiz(sub, task_scores, reviewer_name)
+                comment_changed = self._set_comment(sub, comment, reviewer_name)
+                await s.commit()
+                await self._notify_review(sub, a, changes, old_total, comment_changed, "Вопрос")
+                return sub
             result = CheckResult.from_dict(sub.result)
             by_num = {t.number: t for t in result.tasks}
             changes: list[tuple[TaskResult, int, int]] = []
@@ -588,32 +773,83 @@ class HomeworkService:
                 edited = any(t.auto_score is not None for t in result.tasks)
                 sub.edited_at = utcnow() if edited else None
                 sub.edited_by = reviewer_name if edited else None
-            comment_changed = False
-            if comment is not None:
-                comment = comment.strip()[:3000] or None
-                if comment != sub.organizer_comment:
-                    sub.organizer_comment = comment
-                    sub.comment_at = utcnow() if comment else None
-                    sub.comment_by = reviewer_name if comment else None
-                    comment_changed = bool(comment)
+            comment_changed = self._set_comment(sub, comment, reviewer_name)
             await s.commit()
 
-        if changes or comment_changed:
-            attempt = await self.attempt_number(sub)
-            lines = [f"✏️ Организатор посмотрел твою работу «{escape(a.title)}» (попытка {attempt})."]
-            if changes:
-                lines.append(f"Оценка изменена: <b>{old_total}/{sub.max_score} → {sub.score}/{sub.max_score}</b>")
-                for t, old, new in changes:
-                    lines.append(f"• Задание {t.number}. {escape(t.title)}: {old} → {new}")
-            if comment_changed:
-                author = f" ({escape(sub.comment_by)})" if sub.comment_by else ""
-                lines.append(f"\n💬 Комментарий организатора{author}:\n{escape(sub.organizer_comment)}")
-            await self._notify(sub.user_id, ["\n".join(lines)])
+        await self._notify_review(
+            sub, a, [(t.number, t.title, old, new) for t, old, new in changes], old_total, comment_changed, "Задание"
+        )
         return sub
+
+    @staticmethod
+    def _set_comment(sub: Submission, comment: str | None, reviewer_name: str | None) -> bool:
+        if comment is None:
+            return False
+        comment = comment.strip()[:3000] or None
+        if comment == sub.organizer_comment:
+            return False
+        sub.organizer_comment = comment
+        sub.comment_at = utcnow() if comment else None
+        sub.comment_by = reviewer_name if comment else None
+        return bool(comment)
+
+    @staticmethod
+    def _review_quiz(sub: Submission, scores: dict[int, int], reviewer_name: str | None) -> tuple[list, int]:
+        """Ручные баллы по вопросам теста. Ключи — номера вопросов."""
+        result = dict(sub.result)
+        items = [dict(q) for q in result.get("questions", [])]
+        by_num = {q["number"]: q for q in items}
+        changes = []
+        for num, new in scores.items():
+            q = by_num.get(int(num))
+            if q is None:
+                raise ServiceError(f"Нет вопроса {num}")
+            new = int(new)
+            if not 0 <= new <= q["points"]:
+                raise ServiceError(f"Вопрос {num}: баллы должны быть от 0 до {q['points']}")
+            if new == q["score"]:
+                continue
+            if q.get("auto_score") is None:
+                q["auto_score"] = q["score"]
+            changes.append((q["number"], "", q["score"], new))
+            q["score"] = new
+            if q["auto_score"] == new:
+                q["auto_score"] = None
+        old_total = sub.score or 0
+        if changes:
+            if sub.auto_score is None:
+                sub.auto_score = old_total
+            result = qz.summarize({**result, "questions": items})
+            sub.result = result
+            sub.score = result["score"]
+            edited = any(q.get("auto_score") is not None for q in items)
+            sub.edited_at = utcnow() if edited else None
+            sub.edited_by = reviewer_name if edited else None
+            if not edited:
+                sub.auto_score = None
+        return changes, old_total
+
+    async def _notify_review(self, sub, a, changes, old_total, comment_changed, item: str) -> None:
+        if not (changes or comment_changed):
+            return
+        attempt = await self.attempt_number(sub)
+        what = "твой тест" if sub.kind == "quiz" else "твою работу"
+        lines = [f"✏️ Организатор посмотрел {what} «{escape(a.title)}» (попытка {attempt})."]
+        if changes:
+            lines.append(f"Оценка изменена: <b>{old_total}/{sub.max_score} → {sub.score}/{sub.max_score}</b>")
+            for number, title, old, new in changes:
+                label = f"{item} {number}. {escape(title)}" if title else f"{item} {number}"
+                lines.append(f"• {label}: {old} → {new}")
+        if comment_changed:
+            author = f" ({escape(sub.comment_by)})" if sub.comment_by else ""
+            lines.append(f"\n💬 Комментарий организатора{author}:\n{escape(sub.organizer_comment)}")
+        await self._notify(sub.user_id, ["\n".join(lines)])
 
     async def submission_code(self, submission_id: int, include_reference: bool = True) -> dict:
         """Код участника: по заданиям (как его увидел агент) и все кодовые ячейки ноутбука."""
         sub = await self.get_submission(submission_id)
+        if sub.kind == "quiz":
+            raise ServiceError("У попытки теста нет кода")
         include_reference = include_reference or reference_available(sub.assignment)
         raw = Path(sub.file_path).read_bytes()
         cells = load_notebook(raw)
@@ -629,27 +865,56 @@ class HomeworkService:
         }
 
     async def export_csv(self, assignment_id: int) -> str:
-        """Лучший результат каждого участника по заданию."""
+        """Лучший результат каждого участника по заданию (итог = лучший ноутбук + лучший тест)."""
         a = await self.get_assignment(assignment_id)
         subs = await self.list_assignment_submissions(assignment_id)
-        best: dict[int, Submission] = {}
+        best: dict[tuple[int, str], Submission] = {}
         attempts: dict[int, int] = {}
+        users: dict[int, User] = {}
         for sub in subs:
             if sub.status != "done":
                 continue
+            kind = sub.kind or "notebook"
+            users[sub.user_id] = sub.user
             attempts[sub.user_id] = attempts.get(sub.user_id, 0) + 1
-            if sub.user_id not in best or (sub.score or 0) > (best[sub.user_id].score or 0):
-                best[sub.user_id] = sub
+            key = (sub.user_id, kind)
+            if key not in best or (sub.score or 0) > (best[key].score or 0):
+                best[key] = sub
+        nb, quiz = has_notebook(a), bool(a.quiz)
+        nq = len(a.quiz["questions"]) if quiz else 0
+
+        def score(uid: int, kind: str) -> int | None:
+            sub = best.get((uid, kind))
+            return sub.score if sub else None
+
+        rows = []
+        for uid, u in users.items():
+            total = combine(score(uid, "notebook"), score(uid, "quiz"))
+            row = [uid, u.username or "", u.nickname or "", u.fio or "", u.full_name, total, total_max(a), attempts[uid]]
+            if nb and quiz:
+                row.append(score(uid, "notebook"))
+            if nb:
+                sub = best.get((uid, "notebook"))
+                tasks = [t.get("score") for t in (sub.result or {}).get("tasks", [])] if sub else []
+                row += tasks + [None] * (a.task_count - len(tasks))
+            if quiz:
+                sub = best.get((uid, "quiz"))
+                row.append(sub.score if sub else None)
+                per = {q["number"]: q["score"] for q in (sub.result or {}).get("questions", [])} if sub else {}
+                row += [per.get(i) for i in range(1, nq + 1)]
+            rows.append((total or 0, row))
         buf = io.StringIO()
         w = csv.writer(buf)
         header = ["tg_id", "username", "nickname", "fio", "tg_name", "best_score", "max_score", "attempts"]
-        header += [f"task_{i}" for i in range(1, a.task_count + 1)]
+        if nb and quiz:
+            header.append("notebook_score")
+        if nb:
+            header += [f"task_{i}" for i in range(1, a.task_count + 1)]
+        if quiz:
+            header += ["quiz_score"] + [f"q_{i}" for i in range(1, nq + 1)]
         w.writerow(header)
-        for uid, sub in sorted(best.items(), key=lambda kv: -(kv[1].score or 0)):
-            task_scores = [t.get("score") for t in (sub.result or {}).get("tasks", [])]
-            u = sub.user
-            w.writerow([uid, u.username or "", u.nickname or "", u.fio or "", u.full_name,
-                        sub.score, sub.max_score, attempts[uid], *task_scores])
+        for _, row in sorted(rows, key=lambda r: -r[0]):
+            w.writerow(row)
         return buf.getvalue()
 
     # ---------- рассылки и планировщик ----------
@@ -686,7 +951,12 @@ class HomeworkService:
                 text += f"\n{escape(a.description)}"
             if a.deadline:
                 text += f"\nДедлайн: {fmt_dt(a.deadline, self.settings.tz)} (МСК)"
-            text += "\n\nОткрой /tasks, чтобы скачать шаблон."
+            parts = []
+            if a.quiz:
+                parts.append(f"тест из {len(a.quiz['questions'])} вопр. (в мини аппе)")
+            if has_notebook(a):
+                parts.append("ноутбук (шаблон в /tasks)")
+            text += "\n\nВ задании: " + " и ".join(parts) + "."
             await self.broadcast(text)
 
     async def _scheduler(self) -> None:
