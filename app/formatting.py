@@ -45,6 +45,28 @@ def feedback_messages(
     return pack(blocks)
 
 
+def quiz_messages(
+    assignment_title: str, attempt: int | None, result: dict, organizer_comment: str | None = None, reveal: bool = False
+) -> list[str]:
+    """Итог попытки теста. Формулы в Telegram не отрисуются, поэтому подробный разбор — в мини аппе."""
+    head = (
+        f"🧩 <b>Тест «{escape(assignment_title)}»</b>, попытка {attempt or '—'}\n"
+        f"Итог: <b>{result.get('score', 0)}/{result.get('max_score', 0)}</b> · "
+        f"верно {result.get('correct', 0)} из {len(result.get('questions', []))}\n"
+        f"{escape(result.get('auto_comment') or '')}"
+    )
+    marks = []
+    for q in result.get("questions", []):
+        icon = "✅" if q.get("score") == q.get("points") else ("🟡" if q.get("score") else "❌")
+        edited = f" (изменено, было {q['auto_score']})" if q.get("auto_score") is not None else ""
+        marks.append(f"{icon} Вопрос {q.get('number')}: {q.get('score')}/{q.get('points')}{edited}")
+    blocks = [head, "\n".join(marks)]
+    blocks.append("Разбор с формулами — в мини аппе." + ("" if reveal else " Правильные ответы откроются после дедлайна."))
+    if organizer_comment:
+        blocks.append(f"💬 <b>Комментарий организатора:</b>\n{escape(organizer_comment)}")
+    return pack(blocks)
+
+
 def pack(blocks: list[str], limit: int = TG_LIMIT) -> list[str]:
     messages: list[str] = []
     cur = ""

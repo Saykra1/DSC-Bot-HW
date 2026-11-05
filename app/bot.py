@@ -27,9 +27,9 @@ from aiogram.types import (
 )
 
 from app.checker import CheckResult
-from app.formatting import feedback_messages, fmt_dt
+from app.formatting import feedback_messages, fmt_dt, quiz_messages
 from app.hackathons import hackathons_for
-from app.service import HomeworkService, ServiceError, is_published, reference_available
+from app.service import HomeworkService, ServiceError, has_notebook, is_published, quiz_attempts, reference_available
 
 log = logging.getLogger(__name__)
 
@@ -165,6 +165,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
     async def help_cmd(message: Message):
         await message.answer(
             "Как сдавать: /tasks → задание → «Сдать работу» → отправь .ipynb файлом.\n"
+            "Если в задании есть тест, он проходится в мини аппе (кнопка «Домашки»).\n"
             "Можно просто прислать .ipynb, я спрошу, к какому заданию его отнести.\n"
             "Число попыток ограничено, засчитывается лучшая.\n"
             "После дедлайна в карточке задания появится эталонное решение.\n\n"
@@ -210,23 +211,31 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         lines = [f"<b>{escape(a.title)}</b>"]
         if a.description:
             lines.append(escape(a.description))
-        lines.append(f"Заданий в ноутбуке: {a.task_count}")
-        lines.append(f"Попытки: {view.attempts_used} из {a.max_attempts}")
+        nb = has_notebook(a)
+        if a.quiz:
+            lines.append(f"🧩 Тест: {len(a.quiz['questions'])} вопр., попытки {view.quiz_attempts_used} из {quiz_attempts(a)}"
+                         " — проходится в мини аппе")
+        if nb:
+            lines.append(f"📓 Заданий в ноутбуке: {a.task_count}, попытки {view.attempts_used} из {a.max_attempts}")
         if a.deadline:
             lines.append(f"Дедлайн: {fmt_dt(a.deadline, tz)} (МСК)")
         if not is_published(a):
             lines.append(f"🕒 Участники увидят задание {fmt_dt(a.publish_at, tz)} (МСК)")
         if view.best_score is not None:
             lines.append(f"Лучший результат: {view.best_score}/{view.max_score}")
-        rows = [
-            [InlineKeyboardButton(text="📥 Скачать шаблон", callback_data=f"tpl:{aid}")],
-            [InlineKeyboardButton(text="📤 Сдать работу", callback_data=f"sub:{aid}")],
-            [InlineKeyboardButton(text="🗂 Мои попытки", callback_data=f"my:{aid}")],
-        ]
-        if reference_available(a):
+        rows = []
+        if a.quiz and service.webapp_url:
+            rows.append([InlineKeyboardButton(text="🧩 Пройти тест", web_app=WebAppInfo(url=service.webapp_url))])
+        if nb:
+            rows += [
+                [InlineKeyboardButton(text="📥 Скачать шаблон", callback_data=f"tpl:{aid}")],
+                [InlineKeyboardButton(text="📤 Сдать работу", callback_data=f"sub:{aid}")],
+            ]
+        rows.append([InlineKeyboardButton(text="🗂 Мои попытки", callback_data=f"my:{aid}")])
+        if reference_available(a) and nb:
             lines.append("Дедлайн прошёл: можно сравнить своё решение с эталоном.")
             rows.append([InlineKeyboardButton(text="📗 Эталонное решение", callback_data=f"ref:{aid}")])
-        elif a.deadline:
+        elif a.deadline and nb:
             lines.append("Эталон откроется после дедлайна.")
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
         await cb.message.answer("\n".join(lines), reply_markup=kb)
@@ -393,9 +402,9 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         if not name.lower().endswith(".ipynb"):
             await message.answer("Я принимаю .ipynb (домашки) и .csv (решения хакатона).")
             return
-        views = await service.list_assignments(message.from_user.id)
+        views = [v for v in await service.list_assignments(message.from_user.id) if has_notebook(v.assignment)]
         if not views:
-            await message.answer("Сейчас нет открытых заданий.")
+            await message.answer("Сейчас нет открытых заданий с ноутбуком.")
             return
         await state.update_data(pending_file_id=message.document.file_id, pending_file_name=name)
         rows = [
@@ -427,9 +436,11 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         for s in subs[:15]:
             score = f"{s.score}/{s.max_score}" if s.status == "done" else STATUS_TEXT.get(s.status, s.status)
             attempt = f"попытка {s.attempt}" if s.attempt else "не засчитана"
-            lines.append(f"{escape(s.assignment.title)} · {attempt} · {fmt_dt(s.created_at, tz)} · {score}")
+            part = "тест · " if s.kind == "quiz" else ""
+            lines.append(f"{escape(s.assignment.title)} · {part}{attempt} · {fmt_dt(s.created_at, tz)} · {score}")
             if s.status == "done":
-                rows.append([InlineKeyboardButton(text=f"Отзыв: {s.assignment.title[:40]} · попытка {s.attempt}",
+                label = "Тест" if s.kind == "quiz" else "Отзыв"
+                rows.append([InlineKeyboardButton(text=f"{label}: {s.assignment.title[:40]} · попытка {s.attempt}",
                                                   callback_data=f"res:{s.id}")])
         await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
 
@@ -462,6 +473,10 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             if sub.error and admin_view:
                 text += f"\n{escape(sub.error[:1000])}"
             await message.answer(text)
+        elif sub.kind == "quiz":
+            reveal = admin_view or reference_available(sub.assignment)
+            for text in quiz_messages(sub.assignment.title, sub.attempt, sub.result, sub.organizer_comment, reveal):
+                await message.answer(text)
         else:
             for text in feedback_messages(
                 sub.assignment.title, sub.attempt, CheckResult.from_dict(sub.result), sub.organizer_comment
@@ -658,7 +673,8 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         for s in subs[:40]:
             score = f"{s.score}/{s.max_score}" if s.status == "done" else STATUS_TEXT.get(s.status, s.status)
             attempt = f"№{s.attempt}" if s.attempt else "№—"
-            lines.append(f"/sub {s.id} · {attempt} · {escape(s.user.admin_label)} · {score}")
+            part = " · тест" if s.kind == "quiz" else ""
+            lines.append(f"/sub {s.id}{part} · {attempt} · {escape(s.user.admin_label)} · {score}")
         await cb.message.answer("\n".join(lines))
         await cb.answer()
 
@@ -673,6 +689,8 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         await send_result(message, message.from_user.id, sid, admin_view=True)
         try:
             sub = await service.get_submission(sid)
+            if sub.kind == "quiz":
+                return
             await message.answer_document(
                 BufferedInputFile(Path(sub.file_path).read_bytes(), filename=sub.file_name or f"submission_{sid}.ipynb")
             )
@@ -724,7 +742,8 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
         if not is_admin(message):
             return
         parts = (command.args or "").split()
-        usage = "Использование: <code>/score &lt;id сдачи&gt; 1=8 2=10</code>"
+        usage = ("Использование: <code>/score &lt;id сдачи&gt; 1=8 2=10</code>\n"
+                 "Для попытки теста номера — это вопросы, баллы от 0 до веса вопроса.")
         if len(parts) < 2 or not parts[0].isdigit():
             await message.answer(usage)
             return

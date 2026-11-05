@@ -96,6 +96,7 @@ class Assignment(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     title: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text, default="")
+    # Ноутбучная часть. Пустые пути — у задания только тест.
     template_path: Mapped[str] = mapped_column(String(500))
     reference_path: Mapped[str] = mapped_column(String(500))
     task_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -106,6 +107,8 @@ class Assignment(Base):
     publish_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     # Разослано ли уведомление о новом задании. NULL у старых записей = уже не рассылать.
     announced: Mapped[bool | None] = mapped_column(Boolean)
+    # Тестовая часть (см. app/quiz.py). None — теста нет.
+    quiz: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     submissions: Mapped[list["Submission"]] = relationship(back_populates="assignment")
@@ -117,9 +120,11 @@ class Submission(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.tg_id"), index=True)
-    file_path: Mapped[str] = mapped_column(String(500))
+    # notebook (NULL у старых записей) | quiz
+    kind: Mapped[str | None] = mapped_column(String(16))
+    file_path: Mapped[str] = mapped_column(String(500))  # у попытки теста пустой
     file_name: Mapped[str] = mapped_column(String(256), default="")
-    # queued -> checking -> done | error
+    # queued -> checking -> done | error (попытка теста сразу done)
     status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
     score: Mapped[int | None] = mapped_column(Integer)
     max_score: Mapped[int | None] = mapped_column(Integer)

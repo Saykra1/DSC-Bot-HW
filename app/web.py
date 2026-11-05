@@ -1,6 +1,7 @@
 """API и статика мини аппа (FastAPI)."""
 
 
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,7 +19,8 @@ from pydantic import BaseModel
 
 from app import metrics
 from app.hackathons import UploadedFile, hackathons_for
-from app.service import HomeworkService, ServiceError, reference_available, submission_to_dict
+from app import quiz as qz
+from app.service import HomeworkService, ServiceError, has_notebook, reference_available, submission_to_dict, total_max
 
 STATIC = Path(__file__).parent / "static"
 INIT_DATA_MAX_AGE = 24 * 3600
@@ -34,8 +36,31 @@ class ActiveIn(BaseModel):
 
 
 class ReviewIn(BaseModel):
-    task_scores: dict[int, int] = {}
+    task_scores: dict[int, int] = {}  # у теста ключи — номера вопросов
     comment: str | None = None
+
+
+class QuizAnswersIn(BaseModel):
+    answers: dict[str, str | list[str] | None] = {}
+
+
+def participant_view(d: dict, sub) -> dict:
+    """Участнику до дедлайна не отдаём правильные ответы теста."""
+    if sub.kind == "quiz" and d.get("result") and not reference_available(sub.assignment):
+        d["result"] = qz.hide_keys(d["result"])
+    return d
+
+
+def parse_quiz_field(value: str | None):
+    """Тест из формы: None — не прислали (пустую строку FastAPI тоже отдаёт как None), "null" — убрать, иначе JSON."""
+    if value is None:
+        return False
+    if not value.strip() or value.strip() == "null":
+        return None
+    try:
+        return json.loads(value)
+    except ValueError:
+        raise HTTPException(400, "Неверный формат теста")
 
 
 @dataclass
@@ -71,9 +96,14 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         return dt.replace(tzinfo=settings.tz) if dt.tzinfo is None else dt
 
     def opt_dt(value: str | None, what: str):
-        """Для правки: None — поле не прислали (не менять), пустая строка — убрать."""
+        """Для правки: None — поле не прислали (не менять), "null" — убрать.
+
+        Пустую строку из формы FastAPI отдаёт как None, поэтому для «убрать» нужен явный "null".
+        """
         if value is None:
             return False
+        if value.strip() == "null":
+            return None
         return parse_dt(value, what)
 
     async def current_user(x_telegram_init_data: Annotated[str, Header()] = "") -> CurrentUser:
@@ -182,10 +212,28 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
             raise err(e)
         return submission_to_dict(sub)
 
+    @api.get("/assignments/{aid}/quiz")
+    async def quiz(aid: int, user: UserDep):
+        try:
+            return await service.quiz_for(aid, user.id)
+        except ServiceError as e:
+            raise HTTPException(404, str(e))
+
+    @api.post("/assignments/{aid}/quiz")
+    async def submit_quiz(aid: int, body: QuizAnswersIn, user: UserDep):
+        try:
+            sub = await service.submit_quiz(user.id, aid, body.answers)
+            sub = await service.get_submission(sub.id)
+        except ServiceError as e:
+            raise err(e)
+        d = submission_to_dict(sub) | {"assignment_title": sub.assignment.title,
+                                       "reference_available": reference_available(sub.assignment)}
+        return d if user.is_admin else participant_view(d, sub)
+
     @api.get("/submissions")
     async def my_submissions(user: UserDep, assignment_id: int | None = None):
         subs = await service.list_user_submissions(user.id, assignment_id)
-        return [submission_to_dict(s) | {"assignment_title": s.assignment.title} for s in subs]
+        return [participant_view(submission_to_dict(s) | {"assignment_title": s.assignment.title}, s) for s in subs]
 
     @api.get("/submissions/{sid}")
     async def submission(sid: int, user: UserDep):
@@ -201,6 +249,7 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         }
         if not user.is_admin:
             d["error"] = None
+            d = participant_view(d, sub)
         return d
 
     @api.get("/submissions/{sid}/code")
@@ -282,23 +331,33 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
     async def create_assignment(
         user: AdminDep,
         title: Annotated[str, Form()],
-        template: UploadFile = File(...),
-        reference: UploadFile = File(...),
+        template: UploadFile | None = File(None),
+        reference: UploadFile | None = File(None),
         description: Annotated[str, Form()] = "",
         max_attempts: Annotated[int | None, Form()] = None,
         deadline: Annotated[str, Form()] = "",
         publish_at: Annotated[str, Form()] = "",
+        quiz: Annotated[str | None, Form()] = None,
     ):
+        """Задание: ноутбук (template + reference), тест (quiz — JSON конструктора) или обе части."""
         dl = parse_dt(deadline, "дедлайн")
         pub = parse_dt(publish_at, "время публикации")
+        tpl, ref = await upload(template), await upload(reference)
+        quiz_data = parse_quiz_field(quiz)
         try:
             a, warnings = await service.create_assignment(
-                title, description, await template.read(), await reference.read(), max_attempts, dl, pub
+                title, description, tpl.data if tpl else None, ref.data if ref else None, max_attempts, dl, pub,
+                quiz=quiz_data or None,
             )
         except ServiceError as e:
             raise err(e)
+        return {"id": a.id, "warnings": warnings, "tasks": await tasks_of(a)}
+
+    async def tasks_of(a) -> list[dict]:
+        if not has_notebook(a):
+            return []
         prepared = await service._get_prepared(a)
-        return {"id": a.id, "warnings": warnings, "tasks": [{"number": t.number, "title": t.title} for t in prepared.tasks]}
+        return [{"number": t.number, "title": t.title} for t in prepared.tasks]
 
     @api.patch("/admin/assignments/{aid}")
     async def update_assignment(aid: int, body: ActiveIn, user: AdminDep):
@@ -319,8 +378,9 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         publish_at: Annotated[str | None, Form()] = None,
         template: UploadFile | None = File(None),
         reference: UploadFile | None = File(None),
+        quiz: Annotated[str | None, Form()] = None,
     ):
-        """Правка задания. Не присланные поля не меняются; пустая строка в deadline/publish_at — убрать."""
+        """Правка задания. Не присланные поля не меняются; quiz="null" — убрать тест."""
         tpl = await upload(template)
         ref = await upload(reference)
         try:
@@ -328,12 +388,46 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
                 aid, title=title, description=description, max_attempts=max_attempts,
                 deadline=opt_dt(deadline, "дедлайн"), publish_at=opt_dt(publish_at, "время публикации"),
                 template_raw=tpl.data if tpl else None, reference_raw=ref.data if ref else None,
+                quiz=parse_quiz_field(quiz),
             )
         except ServiceError as e:
             raise err(e)
-        prepared = await service._get_prepared(a)
-        return {"id": a.id, "warnings": warnings, "files_changed": bool(tpl or ref),
-                "tasks": [{"number": t.number, "title": t.title} for t in prepared.tasks]}
+        return {"id": a.id, "warnings": warnings, "files_changed": bool(tpl or ref), "tasks": await tasks_of(a)}
+
+    @api.get("/admin/assignments/{aid}/quiz")
+    async def quiz_full(aid: int, user: AdminDep):
+        try:
+            return await service.quiz_full(aid)
+        except ServiceError as e:
+            raise HTTPException(404, str(e))
+
+    @api.get("/admin/assignments/{aid}/quiz.md")
+    async def quiz_markdown(aid: int, user: AdminDep):
+        try:
+            a = await service.get_assignment(aid)
+        except ServiceError as e:
+            raise HTTPException(404, str(e))
+        if not a.quiz:
+            raise HTTPException(404, "В этом задании нет теста")
+        return Response(qz.to_markdown(a.quiz, a.title).encode("utf-8"), media_type="text/markdown",
+                        headers=attachment(f"{a.title[:60]}.md"))
+
+    @api.post("/admin/quiz/parse")
+    async def quiz_parse(user: AdminDep, file: UploadFile | None = File(None), text: Annotated[str, Form()] = ""):
+        """Разбор .md с вопросами для конструктора (в базу ничего не пишется)."""
+        if file is not None and file.filename:
+            raw = await file.read()
+            if len(raw) > 2 * 1024 * 1024:
+                raise HTTPException(400, "Файл слишком большой (максимум 2 МБ)")
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raise HTTPException(400, "Файл должен быть в кодировке UTF-8")
+        try:
+            data, warnings = qz.parse_markdown(text)
+        except qz.QuizError as e:
+            raise HTTPException(400, str(e))
+        return data | {"warnings": warnings}
 
     @api.post("/admin/assignments/{aid}/recheck")
     async def recheck_assignment(aid: int, user: AdminDep):
@@ -447,7 +541,7 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
     async def participants(user: AdminDep):
         assignments, rows = await service.participants()
         return {
-            "assignments": [{"id": a.id, "title": a.title, "max_score": a.task_count * 10} for a in assignments],
+            "assignments": [{"id": a.id, "title": a.title, "max_score": total_max(a)} for a in assignments],
             "participants": rows,
         }
 
@@ -457,6 +551,8 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
             sub = await service.get_submission(sid)
         except ServiceError as e:
             raise HTTPException(404, str(e))
+        if not sub.file_path:
+            raise HTTPException(404, "У попытки теста нет файла")
         return FileResponse(sub.file_path, filename=sub.file_name or f"submission_{sid}.ipynb")
 
     return api
@@ -471,7 +567,7 @@ def build_app(service: HomeworkService, bot: Bot | None, lifespan=None) -> FastA
     @app.get("/")
     async def index():
         # Версия в ссылках на css/js меняется при каждом изменении файлов, чтобы Telegram не держал старые
-        version = str(max(int((STATIC / name).stat().st_mtime) for name in ("app.css", "app.js")))
+        version = str(max(int((STATIC / name).stat().st_mtime) for name in ("app.css", "app.js", "quiz.js")))
         html = (STATIC / "index.html").read_text(encoding="utf-8").replace("__V__", version)
         return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
