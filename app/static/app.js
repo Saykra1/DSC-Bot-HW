@@ -330,13 +330,26 @@ function assignmentState(a, subs) {
     if (closed) return { kind: "bad", icon: "lock", status: "Закрыто", meta: a.deadline ? `дедлайн ${dm(a.deadline)}` : "приём закрыт", group: "done" };
     return { kind: "good", icon: "check", status: "Открыто", meta: a.deadline ? `до ${dm(a.deadline)}` : "без дедлайна", group: "active" };
   }
-  if (pending) return { kind: "accent", icon: "clock", status: "Проверяется", meta: a.deadline ? `до ${dm(a.deadline)}` : "", group: "active" };
-  if (a.best_score !== null) {
-    return { kind: "good", icon: "check", status: "Проверено", meta: `${a.attempts_used} из ${a.max_attempts} ${plural(a.max_attempts, "попытки", "попыток", "попыток")}`,
-      score: `${a.best_score}/${a.max_score}`, group: closed || a.attempts_used >= a.max_attempts ? "done" : "active" };
+  // Части задания: тест и/или ноутбук. У старого сервера частей нет — значит, только ноутбук.
+  const parts = [a.quiz && { ...a.quiz, kind: "quiz" }, (a.notebook || !a.parts) && { kind: "notebook", best_score: a.best_score,
+    attempts_used: a.attempts_used, max_attempts: a.max_attempts, ...(a.notebook || {}) }].filter(Boolean);
+  const what = parts.length > 1 ? "тест + ноутбук" : parts[0]?.kind === "quiz" ? "тест" : "";
+  const due = a.deadline ? `до ${dm(a.deadline)}` : "без дедлайна";
+  const meta = (...xs) => xs.filter(Boolean).join(" · ");
+  const doneParts = parts.filter((p) => p.best_score !== null && p.best_score !== undefined);
+  const exhausted = parts.every((p) => p.attempts_used >= p.max_attempts);
+  if (pending) return { kind: "accent", icon: "clock", status: "Проверяется", meta: meta(what, a.deadline && `до ${dm(a.deadline)}`), group: "active" };
+  if (a.best_score !== null && doneParts.length < parts.length && !closed) {
+    return { kind: "warn", icon: "check", status: `Готово ${doneParts.length} из ${parts.length} частей`, meta: due, score: `${a.best_score}/${a.max_score}`, group: "active" };
   }
-  if (closed) return { kind: "bad", icon: "lock", status: a.is_active ? "Просрочено" : "Закрыто", meta: a.reference_available ? "эталон открыт" : "приём закрыт", score: "—", group: "done" };
-  return { kind: "neutral", icon: "file", status: "Не начато", meta: a.deadline ? `до ${dm(a.deadline)}` : "без дедлайна", group: "active" };
+  if (a.best_score !== null) {
+    const p = parts.length === 1 ? parts[0] : null;
+    return { kind: "good", icon: "check", status: p?.kind === "quiz" ? "Пройдено" : "Проверено",
+      meta: p ? `${p.attempts_used} из ${p.max_attempts} ${plural(p.max_attempts, "попытки", "попыток", "попыток")}` : what,
+      score: `${a.best_score}/${a.max_score}`, group: closed || exhausted ? "done" : "active" };
+  }
+  if (closed) return { kind: "bad", icon: "lock", status: a.is_active ? "Просрочено" : "Закрыто", meta: a.reference_available ? (a.notebook ? "эталон открыт" : "ответы открыты") : "приём закрыт", score: "—", group: "done" };
+  return { kind: "neutral", icon: parts.length === 1 && parts[0].kind === "quiz" ? "quiz" : "file", status: "Не начато", meta: meta(what, due), group: "active" };
 }
 function avgScore(list) {
   const done = list.filter((a) => a.best_score !== null && a.max_score);
@@ -402,20 +415,26 @@ function homeRoute() {
   };
 }
 
-function assignmentRoute(id) {
+// Экран задания. Если частей две (тест и ноутбук) — сначала выбор части, если одна — сразу она.
+function assignmentRoute(id, part) {
   const route = {
     async render(get) {
       const [list, subs] = await Promise.all([get("/assignments"), get("/submissions")]);
       const a = list.find((x) => x.id === id);
       if (!a) throw new Error("Задание не найдено");
-      const mine = subs.filter((s) => s.assignment_id === id);
+      const parts = partsOf(a);
+      const single = parts.length === 1;
+      const which = part || (single ? parts[0] : null);
+      if (!which) return partsChooserHtml(a, subs);
+      if (which === "quiz") return quizPartHtml(a, subs, get, single);
+      const mine = subs.filter((s) => s.assignment_id === id && (s.kind || "notebook") === "notebook");
       const closed = !a.is_active || (a.deadline && new Date(a.deadline) < new Date());
       const left_ = a.max_attempts - a.attempts_used;
       const pending = mine.find((s) => s.status === "queued" || s.status === "checking");
       const chips = `<div class="row wrap" style="gap:6px">
         ${a.deadline ? `<span class="chip big ${closed ? "bad" : "accent"}">${ic("clock", 14, 2)}${closed ? "закрыто" : "до"} ${msk(a.deadline)}</span>` : `<span class="chip big">без дедлайна</span>`}
         <span class="chip big">${a.attempts_used} из ${a.max_attempts} ${plural(a.max_attempts, "попытки", "попыток", "попыток")}</span>
-        <span class="chip big">${a.task_count} ${plural(a.task_count, "задание", "задания", "заданий")}</span>
+        <span class="chip big">${a.task_count} ${plural(a.task_count, "задание", "задания", "заданий")}${single ? "" : ` · ${a.task_count * 10} баллов`}</span>
         ${!a.published ? `<span class="chip big warn">появится ${msk(a.publish_at)}</span>` : ""}</div>`;
       const steps = pending ? progressCard(pending) : "";
       const upload = closed || left_ <= 0 ? "" : `
@@ -438,9 +457,8 @@ function assignmentRoute(id) {
         ? (a.reference_available ? `<div class="cta"><button class="btn dark" onclick="show(referenceRoute(${a.id}))">${ic("eye", 18, 2)}Открыть эталон</button></div>`
           : left_ <= 0 && !closed ? `<div class="cta"><button class="btn" disabled>Попытки закончились</button></div>` : "")
         : `<div class="cta"><button class="btn primary" id="submit-btn" disabled onclick="submitWork(${a.id}, this)">${ic("upload", 18, 2)}Сдать работу · попытка ${a.attempts_used + 1} из ${a.max_attempts}</button></div>`;
-      return `${topbar("Задание")}
-        <h1 class="h1">${esc(a.title)}</h1>${chips}
-        ${a.description ? `<div class="card tight pre" style="font-size:14px">${esc(a.description)}</div>` : ""}
+      return `${single ? `${topbar("Задание")}<h1 class="h1">${esc(a.title)}</h1>` : `${topbar(esc(a.title))}<h1 class="h1">Ноутбук</h1>`}${chips}
+        ${single && a.description ? `<div class="card tight pre" style="font-size:14px">${esc(a.description)}</div>` : ""}
         <div class="row wrap" style="gap:8px">
           ${ME.bot_enabled ? `<button class="btn sm press" onclick="sendFile('/assignments/${a.id}/template/send','Шаблон отправлен в чат с ботом')">${ic("send", 16, 2)}Шаблон в чат</button>` : ""}
           <button class="btn sm press" onclick="download('/assignments/${a.id}/template','template.ipynb')">${ic("download", 16, 2)}Скачать шаблон</button>
@@ -460,11 +478,12 @@ function assignmentRoute(id) {
 
 function subRow(s, withTitle = false) {
   const st = s.status === "done" ? scoreKind(s.score, s.max_score) : s.status === "error" ? "bad" : "accent";
-  const label = s.attempt ? `Попытка №${s.attempt}` : "Не засчитана";
+  const quiz = s.kind === "quiz";
+  const label = (quiz ? "Тест · " : "") + (s.attempt ? `${quiz ? "попытка" : "Попытка"} №${s.attempt}` : "не засчитана");
   const flags = [s.edited_at && "изменено", s.organizer_comment && "комментарий",
     (s.status === "queued" || s.status === "checking") && "проверяется…", s.status === "error" && "проверка не удалась"].filter(Boolean);
   const score = s.status === "done" ? `${s.score}/${s.max_score}` : s.status === "error" ? "—" : "";
-  return `<a class="capsule round" href="#" onclick="event.preventDefault();hap();openSubmission(${s.id})">
+  return `<a class="capsule round" href="#" onclick="event.preventDefault();hap();openSubmission(${s.id}, '${quiz ? "quiz" : "notebook"}')">
     <span class="grow stack" style="gap:2px"><span class="h3 ellipsis">${withTitle ? esc(s.assignment_title) + " · " : ""}${label}</span>
       <span class="small muted ellipsis">${when(s.created_at)}${flags.length ? " · " + flags.join(" · ") : ""}</span></span>
     <span class="score c-${st === "neutral" ? "accent" : st}">${score}</span><span class="chev">${ic("chev", 16)}</span></a>`;
@@ -494,7 +513,7 @@ async function submitWork(id, btn) {
   } catch (e) { toast(e.message, "err"); btn.disabled = false; btn.innerHTML = old; }
 }
 
-function openSubmission(id) { show(ME.is_admin ? reviewRoute(id) : resultRoute(id)); }
+function openSubmission(id, kind) { show(ME.is_admin ? reviewRoute(id) : kind === "quiz" ? quizResultRoute(id) : resultRoute(id)); }
 
 function resultRoute(id) {
   const route = {
@@ -512,7 +531,7 @@ function resultRoute(id) {
       if (s.status === "error") {
         return html + `<div class="state err" style="min-height:40vh"><span class="ill">${ic("alert", 40, 1.6)}</span>
           <span class="h2">Не получилось проверить</span><p>Попытка не засчитана, можно сдать ещё раз. Если повторится — напиши организаторам.</p>
-          ${a && a.attempts_used < a.max_attempts ? `<button class="btn primary" onclick="replace(assignmentRoute(${a.id}))">Сдать ещё раз</button>` : ""}</div>`;
+          ${a && a.attempts_used < a.max_attempts ? `<button class="btn primary" onclick="replace(assignmentRoute(${a.id}, 'notebook'))">Сдать ещё раз</button>` : ""}</div>`;
       }
       const r = s.result;
       const kind = scoreKind(r.score, r.max_score);
@@ -528,7 +547,7 @@ function resultRoute(id) {
       if (s.organizer_comment) html += commentCard(s);
       html += `<button class="btn block press" onclick="show(codeRoute(${s.id}))">${ic("code", 18, 2)}Мой код${s.reference_available ? " и эталон" : ""}</button>`;
       if (a && a.is_active && a.attempts_used < a.max_attempts && !(a.deadline && new Date(a.deadline) < new Date()))
-        html += `<div class="cta"><button class="btn primary" onclick="replace(assignmentRoute(${a.id}))">${ic("upload", 18, 2)}Сдать ещё раз</button></div>`;
+        html += `<div class="cta"><button class="btn primary" onclick="replace(assignmentRoute(${a.id}, 'notebook'))">${ic("upload", 18, 2)}Сдать ещё раз</button></div>`;
       return html;
     },
   };
@@ -612,9 +631,9 @@ let HIST_FILTER = "all";
 function historyRoute() {
   return {
     async render(get) {
-      const subs = await get("/submissions");
+      const [subs, alist] = await Promise.all([get("/submissions"), get("/assignments").catch(() => [])]);
       const head = `<h1 class="h1">Мои сдачи</h1>`;
-      if (!subs.length) return head + emptyState("upload", "Пока ни одной сдачи", "Открой задание, скачай шаблон и пришли .ipynb — агент проверит за пару минут.",
+      if (!subs.length) return head + emptyState("upload", "Пока ни одной сдачи", "Открой задание: пройди тест или пришли .ipynb — агент проверит его за пару минут.",
         `<button class="btn primary" onclick="openTab('home')">К заданиям</button>`);
       const withC = subs.filter((s) => s.organizer_comment).length;
       const list = HIST_FILTER === "comment" ? subs.filter((s) => s.organizer_comment) : subs;
@@ -630,8 +649,10 @@ function historyRoute() {
         const done = g.items.filter((s) => s.status === "done");
         const best = done.length ? Math.max(...done.map((s) => s.score)) : null;
         const pending = g.items.some((s) => s.status === "queued" || s.status === "checking");
+        const av = alist.find((x) => x.id === g.items[0].assignment_id);
+        const total = av && av.best_score !== null ? `итог ${av.best_score}/${av.max_score}` : best !== null ? `лучший ${best}/${done[0].max_score}` : "";
         return `<div class="stack" style="gap:10px"><div class="row between" style="align-items:baseline">
-            <span class="h3">${esc(g.title)}</span><span class="small muted">${pending ? "проверяется" : best !== null ? `лучший ${best}/${done[0].max_score}` : ""}</span></div>
+            <span class="h3">${esc(g.title)}</span><span class="small muted">${pending ? "проверяется" : total}</span></div>
           <div>${g.items.map((s) => {
             const k = s.status === "done" ? scoreKind(s.score, s.max_score) : s.status === "error" ? "neutral" : "accent";
             return `<div class="tl"><div class="rail"><i style="background:var(--${k === "neutral" ? "muted" : k === "accent" ? "accent" : k})"></i><b></b></div>
@@ -821,6 +842,8 @@ function openProfile() {
 // =====================================================================
 let ADMIN_AID = null;
 let SUB_FILTER = "all";
+let SUB_KIND = "all";
+const KIND_OF = new Map(); // id сдачи → notebook | quiz (переживает сброс кеша после сохранения)
 let SELECTED_SID = null;
 const SEARCH = { subs: "", people: "" };
 
@@ -832,7 +855,11 @@ function adminSubsRoute() {
       const head = `<div class="row between"><h1 class="h1">Сдачи</h1><span class="chip accent big">организатор</span></div>`;
       if (!list.length) return head + emptyState("review", "Заданий пока нет", "Сдачи появятся, когда участники начнут присылать работы.");
       if (!list.some((a) => a.id === ADMIN_AID)) ADMIN_AID = (list.find((a) => a.published && a.is_active) || list[0]).id;
-      const subs = await get(`/admin/assignments/${ADMIN_AID}/submissions`);
+      const cur = list.find((a) => a.id === ADMIN_AID);
+      const both = partsOf(cur).length > 1;
+      if (!both) SUB_KIND = "all";
+      const allSubs = await get(`/admin/assignments/${ADMIN_AID}/submissions`);
+      const subs = allSubs.filter((s) => SUB_KIND === "all" || (s.kind || "notebook") === SUB_KIND);
       const counts = {
         all: subs.length,
         queue: subs.filter((s) => s.status === "queued" || s.status === "checking").length,
@@ -842,15 +869,18 @@ function adminSubsRoute() {
       const shown = subs.filter((s) => SUB_FILTER === "all" || (SUB_FILTER === "queue" ? s.status === "queued" || s.status === "checking"
         : SUB_FILTER === "error" ? s.status === "error" : !!s.organizer_comment));
       const asel = `<div class="pills">${list.map((a) => `<button class="pill${a.id === ADMIN_AID ? " on" : ""}" onclick="ADMIN_AID=${a.id};SELECTED_SID=null;hap('select');reload()">${esc(a.title)}</button>`).join("")}</div>`;
+      const kinds = both ? `<div class="seg sm">${[["all", "Все части"], ["quiz", `Тест · ${allSubs.filter((s) => s.kind === "quiz").length}`], ["notebook", `Ноутбук · ${allSubs.filter((s) => (s.kind || "notebook") === "notebook").length}`]].map(([k, l]) =>
+        `<button class="${SUB_KIND === k ? "on" : ""}" onclick="SUB_KIND='${k}';hap('select');reload()">${l}</button>`).join("")}</div>` : "";
       const fpills = `<div class="pills">${[["all", "Все"], ["queue", "В очереди"], ["error", "Ошибки"], ["comment", "С комментарием"]].map(([k, l]) =>
         `<button class="pill sm${SUB_FILTER === k ? " accent" : ""}" onclick="SUB_FILTER='${k}';hap('select');reload()">${l} · ${counts[k]}</button>`).join("")}</div>`;
       const search = `<label class="row input" style="gap:10px;color:var(--muted)">${ic("search", 18, 2)}
         <input class="grow" style="border:0;background:none;outline:none;height:100%" placeholder="Ник, ФИО, @username или id сдачи"
           value="${esc(SEARCH.subs)}" oninput="SEARCH.subs=this.value;filterRows('#subs-list',this.value)"></label>`;
+      allSubs.forEach((x) => KIND_OF.set(x.id, x.kind || "notebook"));
       const rows = shown.map((s) => {
         const k = s.status === "done" ? scoreKind(s.score, s.max_score) : s.status === "error" ? "bad" : "accent";
         const u = s.user || {};
-        const flags = [s.edited_at && `<span class="chip accent">изменено${s.edited_by ? " · " + esc(s.edited_by) : ""}</span>`,
+        const flags = [s.kind === "quiz" && `<span class="chip solid">тест</span>`, s.edited_at && `<span class="chip accent">изменено${s.edited_by ? " · " + esc(s.edited_by) : ""}</span>`,
           s.organizer_comment && `<span class="chip">комментарий</span>`, s.status === "error" && `<span class="chip bad">ошибка проверки</span>`].filter(Boolean).join("");
         const key = [u.name, u.fio, u.username, s.id, u.tg_id].join(" ").toLowerCase();
         return `<a class="capsule round${s.id === SELECTED_SID ? " sel" : ""}" href="#" data-key="${esc(key)}" data-sid="${s.id}" onclick="event.preventDefault();hap();openReview(${s.id})">
@@ -862,7 +892,7 @@ function adminSubsRoute() {
           <span class="score c-${k}">${s.status === "done" ? `${s.score}/${s.max_score}` : s.status === "error" ? "—" : "…"}</span></a>`;
       }).join("");
       const listHtml = `<div class="stack" id="subs-list">${rows || `<p class="muted" style="text-align:center">Сдач нет</p>`}</div>`;
-      return `${head}${asel}${search}${fpills}
+      return `${head}${asel}${kinds}${search}${fpills}
         <div class="split"><div class="split-list">${listHtml}</div>
           <div class="split-pane" id="pane">${emptyState("review", "Выбери сдачу", "Код участника и эталон откроются здесь рядом со списком.")}</div></div>`;
     },
@@ -906,7 +936,13 @@ function reviewRoute(sid) {
   };
 }
 async function reviewHtml(sid, get, inPane) {
-  const [s, code] = await Promise.all([get(`/submissions/${sid}`), get(`/admin/submissions/${sid}/code`).catch((e) => ({ error: e.message, tasks: [], cells: [] }))]);
+  // У попытки теста нет кода: если уже знаем, что это тест, лишний запрос не делаем
+  const isQuiz = KIND_OF.get(sid) === "quiz";
+  const noCode = { error: null, tasks: [], cells: [] };
+  const [s, code] = await Promise.all([get(`/submissions/${sid}`),
+    isQuiz ? noCode : get(`/admin/submissions/${sid}/code`).catch((e) => ({ error: e.message, tasks: [], cells: [] }))]);
+  KIND_OF.set(sid, s.kind || "notebook");
+  if (s.kind === "quiz") return quizReviewHtml(s, inPane);
   const u = s.user || {};
   const r = s.result;
   REV = { sid, task: 0, scores: {}, auto: {} };
@@ -943,9 +979,9 @@ async function reviewHtml(sid, get, inPane) {
   const scores = `<div class="card"><span class="row between"><span class="small muted" style="font-weight:600">Баллы за задания</span><span class="small muted">0–10</span></span>
     ${r.tasks.map((t) => `<div class="task-score"><span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${t.number}. ${esc(t.title)}</span>
         <span class="small muted">агент: ${REV.auto[t.number]}</span></span>
-      <span class="stepper"><button type="button" data-step="-1" data-n="${t.number}" aria-label="Меньше">−</button>
+      <span class="stepper"><button type="button" data-step="-1" data-n="${t.number}" data-max="10" aria-label="Меньше">−</button>
         <span class="v" data-v="${t.number}">${t.score}</span>
-        <button type="button" data-step="1" data-n="${t.number}" aria-label="Больше">+</button></span></div>`).join("")}</div>`;
+        <button type="button" data-step="1" data-n="${t.number}" data-max="10" aria-label="Больше">+</button></span></div>`).join("")}</div>`;
   const myName = ME.profile.name;
   const comment = `<div class="card"><span class="small muted">Комментарий участнику · подпишем как «${esc(myName)}»</span>
     <textarea class="textarea" id="rev-comment" rows="4" placeholder="Что получилось, что поправить…">${esc(s.organizer_comment || "")}</textarea>
@@ -977,7 +1013,7 @@ function bindReview(root, sid) {
   }));
   root.querySelectorAll("[data-step]").forEach((b) => b.addEventListener("click", () => {
     const n = b.dataset.n;
-    const v = Math.max(0, Math.min(10, REV.scores[n] + Number(b.dataset.step)));
+    const v = Math.max(0, Math.min(Number(b.dataset.max || 10), REV.scores[n] + Number(b.dataset.step)));
     if (v === REV.scores[n]) { hap("warning"); return; }
     REV.scores[n] = v;
     hap("select");
@@ -986,6 +1022,10 @@ function bindReview(root, sid) {
     const total = Object.values(REV.scores).reduce((a, x) => a + x, 0);
     const tot = root.querySelector("#rev-total"); if (tot) tot.textContent = total;
     root.querySelector(".review")?.setAttribute("data-dirty", "");
+  }));
+  root.querySelectorAll("#qrev-nav [data-jump]").forEach((b) => b.addEventListener("click", () => {
+    hap("select");
+    root.querySelector(`#qrev-${b.dataset.jump}`)?.scrollIntoView({ block: "start", behavior: "smooth" });
   }));
   root.querySelector("#rev-comment")?.addEventListener("input", () => root.querySelector(".review")?.setAttribute("data-dirty", ""));
   const save = root.querySelector("#rev-save");
@@ -1069,7 +1109,7 @@ function manageRoute() {
           const st = !a.published ? ["accent", `Запланировано · ${dm(a.publish_at)}`] : a.is_active ? ["good", "Открыто"] : ["", "Закрыто"];
           return `<div class="card" style="padding:14px 14px 12px 16px">
             <div class="row" style="align-items:flex-start"><span class="grow stack" style="gap:4px"><span class="h3" style="font-size:16px">${esc(a.title)}</span>
-              <span class="small muted">${a.deadline ? "до " + msk(a.deadline) : "без дедлайна"} · ${a.max_attempts} ${plural(a.max_attempts, "попытка", "попытки", "попыток")} · ${a.task_count} ${plural(a.task_count, "задание", "задания", "заданий")}</span></span>
+              <span class="small muted">${a.deadline ? "до " + msk(a.deadline) : "без дедлайна"} · ${partsLine(a)}</span></span>
               <span class="chip ${st[0]}">${st[1]}</span></div>
             <div class="row wrap" style="gap:6px">
               <button class="btn xs" style="background:var(--bg)" onclick="ADMIN_AID=${a.id};SELECTED_SID=null;openTab('subs')">Сдачи</button>
@@ -1121,52 +1161,112 @@ function assignmentFormRoute(id) {
     async render(get) {
       const a = id ? (await get("/assignments")).find((x) => x.id === id) : null;
       if (id && !a) throw new Error("Задание не найдено");
+      const parts = a ? partsOf(a) : ["notebook"];
+      const quiz = a?.quiz ? await get(`/admin/assignments/${id}/quiz`) : null;
+      QB = { attempts: quiz?.attempts || 1, questions: (quiz?.questions || []).map(qbFrom), had: !!quiz };
+      if (!QB.questions.length) QB.questions.push(qbBlank());
+      await needMath(...quizTexts(QB.questions));
+      const hasNb = parts.includes("notebook");
       const later_ = !!a?.publish_at && !a.published;
+      const label = a ? "Сохранить" : "Создать задание";
+      const partBtn = (key, icon, title, sub, on, locked) => `<button type="button" class="part-toggle${on ? " on" : ""}" data-part="${key}" ${locked ? 'aria-disabled="true"' : ""}>
+          <span class="part-ic">${ic(icon, 22, 2)}</span>
+          <span class="grow stack" style="gap:0"><span class="h3">${title}</span><span class="small muted">${sub}</span></span>
+          <span class="switch${on ? " on" : ""}"></span></button>`;
       return `${topbar(a ? "Изменить задание" : "Новое задание", a ? esc(a.title) : "")}
-        <form id="a-form" class="stack narrow" style="gap:12px" oninput="this.setAttribute('data-dirty','')">
-          <label class="field"><span>Название</span><input class="input" name="title" required value="${esc(a?.title || "")}" placeholder="Например, Линейные модели"></label>
+        <form id="a-form" class="stack narrow" style="gap:12px" novalidate oninput="this.setAttribute('data-dirty','')">
+          <label class="field"><span>Название</span><input class="input" name="title" value="${esc(a?.title || "")}" placeholder="Например, Линейные модели"></label>
           <label class="field"><span>Описание для участников</span><textarea class="textarea" name="description" rows="3">${esc(a?.description || "")}</textarea></label>
-          <div class="field-grid">
-            <label class="field"><span>Попыток</span><input class="input" name="max_attempts" type="number" min="1" value="${a?.max_attempts ?? ""}" placeholder="по умолчанию"></label>
-            <label class="field"><span>Дедлайн, МСК</span><input class="input" name="deadline" type="datetime-local" value="${toInput(a?.deadline)}"></label></div>
+          <div class="field"><span>Из чего состоит задание</span>
+            <div class="parts-pick">
+              ${partBtn("quiz", "quiz", "Тест", "вопросы с вариантами или своим ответом", parts.includes("quiz"), false)}
+              ${partBtn("notebook", "notebook", "Ноутбук", hasNb && a ? "уже в задании, убрать нельзя" : "шаблон .ipynb, проверяет агент", hasNb, hasNb && !!a)}
+            </div></div>
+          <label class="field"><span>Дедлайн, МСК</span><input class="input" name="deadline" type="datetime-local" value="${toInput(a?.deadline)}"></label>
           <button type="button" class="toggle-row" onclick="toggleLater(this)">
             <span class="grow stack" style="gap:0"><span class="h3" style="font-size:14px">Опубликовать позже</span><span class="small muted">участники получат уведомление в это время</span></span>
             <span class="switch${later_ ? " on" : ""}"></span></button>
           <label class="field${later_ ? "" : " hide"}" id="publish-field"><span>Публикация, МСК</span><input class="input" name="publish_at" type="datetime-local" value="${toInput(a?.publish_at)}"></label>
-          ${fileRow("template", a ? "Новый шаблон — только если нужно заменить" : "Шаблон для участников (.ipynb)", ".ipynb", "", !a)}
-          ${fileRow("reference", a ? "Новый эталон — только если нужно заменить" : "Эталонное решение (.ipynb)", ".ipynb", "", !a)}
+
+          <section class="form-sec${parts.includes("quiz") ? "" : " hide"}" id="sec-quiz">
+            <div class="row between" style="align-items:baseline"><span class="h2 row" style="gap:8px">${ic("quiz", 20, 2)}Тест</span><span class="small muted" id="qb-sum"></span></div>
+            ${qbHtml(a?.quiz ? id : null)}</section>
+
+          <section class="form-sec${hasNb ? "" : " hide"}" id="sec-nb">
+            <div class="row between" style="align-items:baseline"><span class="h2 row" style="gap:8px">${ic("notebook", 20, 2)}Ноутбук</span>${hasNb && a ? `<span class="small muted">${a.task_count} ${plural(a.task_count, "задание", "задания", "заданий")}</span>` : ""}</div>
+            <label class="field"><span>Попыток на ноутбук</span><input class="input" name="max_attempts" type="number" min="1" value="${hasNb ? a?.max_attempts ?? "" : ""}" placeholder="по умолчанию"></label>
+            ${fileRow("template", hasNb && a ? "Новый шаблон — только если нужно заменить" : "Шаблон для участников (.ipynb)", ".ipynb", "", false)}
+            ${fileRow("reference", hasNb && a ? "Новый эталон — только если нужно заменить" : "Эталонное решение (.ipynb)", ".ipynb", "", false)}</section>
           <div id="a-result"></div>
-          <div class="cta"><button class="btn primary" type="submit" id="a-save">${a ? "Сохранить" : "Создать задание"}</button></div></form>`;
+          <div class="cta"><button class="btn primary" type="submit" id="a-save" data-label="${label}">${later_ ? "Сохранить и запланировать" : label}</button></div></form>`;
     },
     after() {
+      qbSummary();
+      qbBind();
+      $$(".part-toggle").forEach((b) => b.addEventListener("click", () => {
+        if (b.getAttribute("aria-disabled") === "true") { hap("warning"); toast("Ноутбук нельзя убрать из уже созданного задания", "err"); return; }
+        const on = !b.classList.contains("on");
+        b.classList.toggle("on", on);
+        b.querySelector(".switch").classList.toggle("on", on);
+        const sec = $(b.dataset.part === "quiz" ? "#sec-quiz" : "#sec-nb");
+        sec.classList.toggle("hide", !on);
+        if (on) { sec.classList.remove("enter"); void sec.offsetWidth; sec.classList.add("enter"); }
+        $("#a-form").setAttribute("data-dirty", "");
+        hap("select");
+      }));
       $("#a-form").onsubmit = async (ev) => {
         ev.preventDefault();
         const f = ev.target;
         const fd = new FormData(f);
-        if (!fd.get("max_attempts")) fd.delete("max_attempts");
-        for (const k of ["template", "reference"]) if (!fd.get(k)?.name) fd.delete(k);
-        if ($("#publish-field").classList.contains("hide")) fd.set("publish_at", "");
-        if (!id && !fd.get("publish_at")) fd.delete("publish_at");
+        const quizOn = $('[data-part="quiz"]').classList.contains("on");
+        const nbOn = $('[data-part="notebook"]').classList.contains("on");
+        const a = id ? CACHE.get("/assignments")?.find((x) => x.id === id) : null;
+        const hadNb = !!a && partsOf(a).includes("notebook");
+        if (!String(fd.get("title") || "").trim()) { toast("Укажи название задания", "err"); f.elements.title.focus(); return; }
+        if (!quizOn && !nbOn) { toast("Выбери хотя бы одну часть: тест или ноутбук", "err"); return; }
+        if (nbOn && !hadNb && !(fd.get("template")?.name && fd.get("reference")?.name)) { toast("Для ноутбука нужны оба файла: шаблон и эталон", "err"); return; }
+        if (quizOn) {
+          const bad = qbValidate();
+          if (bad) { toast(bad.msg, "err"); if (bad.i >= 0) qbFlag(bad.i); return; }
+          fd.set("quiz", JSON.stringify(qbPayload()));
+        } else if (QB.had) fd.set("quiz", "null");
+        if (!nbOn || !fd.get("max_attempts")) fd.delete("max_attempts");
+        for (const k of ["template", "reference"]) if (!nbOn || !fd.get(k)?.name) fd.delete(k);
+        const pubHidden = $("#publish-field").classList.contains("hide");
+        if (id) {
+          // При правке пустое поле значит «убрать»: сервер ждёт для этого "null"
+          if (!fd.get("deadline")) fd.set("deadline", "null");
+          if (pubHidden || !fd.get("publish_at")) fd.set("publish_at", "null");
+        } else {
+          if (!fd.get("deadline")) fd.delete("deadline");
+          if (pubHidden || !fd.get("publish_at")) fd.delete("publish_at");
+        }
         const btn = $("#a-save"); btn.disabled = true;
         const old = btn.innerHTML; btn.innerHTML = `<span class="spinner"></span>Сохраняем…`;
         try {
           const r = await api(id ? `/admin/assignments/${id}/edit` : "/admin/assignments", { method: "POST", body: fd });
           f.removeAttribute("data-dirty");
           $$(".file-row", f).forEach((x) => x.removeAttribute("data-dirty"));
-          const tasks = r.tasks?.length ? `<ol style="margin:4px 0;padding-left:20px">${r.tasks.map((t) => `<li>${esc(t.title)}</li>`).join("")}</ol>` : "";
+          const regraded = QB.had && quizOn;
+          QB.had = quizOn;
+          const tasks = r.tasks?.length ? `<span class="h3">Задания в ноутбуке</span><ol style="margin:4px 0;padding-left:20px">${r.tasks.map((t) => `<li>${esc(t.title)}</li>`).join("")}</ol>` : "";
+          const qline = quizOn ? `<span class="h3">Тест: ${QB.questions.length} ${qWord(QB.questions.length)}, ${qbPoints()} ${ptsWord(qbPoints())}</span>` : "";
           const warn = r.warnings?.length ? `<span class="small c-warn">${r.warnings.map(esc).join("<br>")}</span>` : "";
           if (!id) {
             toast(fd.get("publish_at") ? "Задание запланировано" : "Задание создано, участникам ушло уведомление");
-            $("#a-result").innerHTML = `<div class="card tight soft-accent"><span class="h3">Найдены задания</span>${tasks}${warn}</div>`;
+            $("#a-result").innerHTML = `<div class="card tight soft-accent">${qline}${tasks}${warn}</div>`;
             setTimeout(() => { if (stack.length > 1) goBack(); }, warn ? 4000 : 1600);
           } else {
-            toast("Сохранено");
+            toast(regraded ? "Сохранено, попытки теста пересчитаны" : "Сохранено");
             $("#a-result").innerHTML = r.files_changed ? `<div class="card tight soft-warn"><span class="row" style="align-items:flex-start">${ic("warn", 18, 2)}
-              <span class="grow">Файлы заменены, старые оценки остались прежними. Заданий в ноутбуке: ${r.tasks.length}.</span></span>${warn}
+              <span class="grow">Файлы ноутбука заменены, старые оценки остались прежними. Заданий в ноутбуке: ${r.tasks.length}.</span></span>${warn}
               <button type="button" class="btn sm dark" onclick="recheckAll(${id}, this)">${ic("refresh", 16, 2)}Перепроверить все сдачи</button></div>` : warn;
           }
-        } catch (e) { toast(e.message, "err"); }
-        finally { btn.disabled = false; btn.innerHTML = old; }
+        } catch (e) {
+          toast(e.message, "err");
+          const m = /^Вопрос (\d+)/.exec(e.message);
+          if (m) qbFlag(+m[1] - 1);
+        } finally { btn.disabled = false; btn.innerHTML = old; }
       };
     },
   };
@@ -1176,7 +1276,7 @@ function toggleLater(btn) {
   const on = !sw.classList.contains("on");
   sw.classList.toggle("on", on);
   $("#publish-field").classList.toggle("hide", !on);
-  $("#a-save").textContent = on ? "Сохранить и запланировать" : "Сохранить";
+  $("#a-save").textContent = on ? "Сохранить и запланировать" : $("#a-save").dataset.label || "Сохранить";
   hap("select");
 }
 async function recheckAll(id, btn) {

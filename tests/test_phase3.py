@@ -269,3 +269,20 @@ def test_deadline_in_moscow_time_is_stored_correctly(ctx):
     assert r.status_code == 200
     a = client.get("/api/assignments", headers=hdr(STUDENT)).json()[0]
     assert datetime.fromisoformat(a["deadline"]) == datetime(2030, 11, 20, 20, 59, tzinfo=timezone.utc)
+
+
+def test_edit_can_remove_deadline_and_schedule(ctx):
+    client, _, _ = ctx
+    aid = create_assignment(client)
+    later = datetime.now(timezone.utc) + timedelta(days=1)
+    r = client.post(f"/api/admin/assignments/{aid}/edit", headers=hdr(ADMIN),
+                    data={"deadline": local(later), "publish_at": local(later)})
+    assert r.status_code == 200
+    a = client.get("/api/assignments", headers=hdr(ADMIN)).json()[0]
+    assert a["deadline"] and a["publish_at"]
+    # пустое значение не трогает поле, "null" — убирает
+    client.post(f"/api/admin/assignments/{aid}/edit", headers=hdr(ADMIN), data={"deadline": "", "publish_at": ""})
+    assert client.get("/api/assignments", headers=hdr(ADMIN)).json()[0]["deadline"]
+    client.post(f"/api/admin/assignments/{aid}/edit", headers=hdr(ADMIN), data={"deadline": "null", "publish_at": "null"})
+    a = client.get("/api/assignments", headers=hdr(ADMIN)).json()[0]
+    assert a["deadline"] is None and a["publish_at"] is None and a["published"] is True

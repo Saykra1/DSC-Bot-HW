@@ -96,9 +96,14 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         return dt.replace(tzinfo=settings.tz) if dt.tzinfo is None else dt
 
     def opt_dt(value: str | None, what: str):
-        """Для правки: None — поле не прислали (не менять), пустая строка — убрать."""
+        """Для правки: None — поле не прислали (не менять), "null" — убрать.
+
+        Пустую строку из формы FastAPI отдаёт как None, поэтому для «убрать» нужен явный "null".
+        """
         if value is None:
             return False
+        if value.strip() == "null":
+            return None
         return parse_dt(value, what)
 
     async def current_user(x_telegram_init_data: Annotated[str, Header()] = "") -> CurrentUser:
@@ -562,7 +567,7 @@ def build_app(service: HomeworkService, bot: Bot | None, lifespan=None) -> FastA
     @app.get("/")
     async def index():
         # Версия в ссылках на css/js меняется при каждом изменении файлов, чтобы Telegram не держал старые
-        version = str(max(int((STATIC / name).stat().st_mtime) for name in ("app.css", "app.js")))
+        version = str(max(int((STATIC / name).stat().st_mtime) for name in ("app.css", "app.js", "quiz.js")))
         html = (STATIC / "index.html").read_text(encoding="utf-8").replace("__V__", version)
         return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
