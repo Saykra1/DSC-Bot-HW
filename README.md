@@ -188,6 +188,8 @@ ngrok http 8080
 есть готовая конфигурация: `docker-compose.yml`, `Dockerfile` и скрипты в `deploy/`.
 Пошаговая инструкция — [docs/DEPLOY.md](docs/DEPLOY.md).
 
+Как пользоваться ботом организаторам и участникам — [docs/GUIDE.md](docs/GUIDE.md).
+
 ## Команды бота
 
 Участникам:
