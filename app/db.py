@@ -175,7 +175,61 @@ class Hackathon(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     announced: Mapped[bool | None] = mapped_column(Boolean)
     start_notified: Mapped[bool | None] = mapped_column(Boolean)
+    # Командный режим (NULL у старых записей = каждый сам за себя)
+    team_mode: Mapped[bool | None] = mapped_column(Boolean)
+    team_max: Mapped[int | None] = mapped_column(Integer)  # максимум человек в команде
+    # До какого времени формируются команды (NULL — до старта). В этот момент всех без команды распределяем.
+    team_deadline: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    teams_formed: Mapped[bool | None] = mapped_column(Boolean)  # распределение уже прошло, составы закреплены
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class Team(Base):
+    __tablename__ = "teams"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hackathon_id: Mapped[int] = mapped_column(ForeignKey("hackathons.id"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    captain_id: Mapped[int | None] = mapped_column(ForeignKey("users.tg_id"))
+    is_auto: Mapped[bool | None] = mapped_column(Boolean)  # собрана системой из участников без команды
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class TeamMember(Base):
+    """Участник командного хакатона. team_id = NULL — зарегистрировался, но пока без команды."""
+
+    __tablename__ = "team_members"
+    __table_args__ = (UniqueConstraint("hackathon_id", "user_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hackathon_id: Mapped[int] = mapped_column(ForeignKey("hackathons.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.tg_id"), index=True)
+    team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id"), index=True)
+    # pool — «нет команды, распределите», join — «ищу свою команду, жду ответа капитана»
+    intent: Mapped[str | None] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    joined_at: Mapped[datetime | None] = mapped_column(UTCDateTime)  # когда попал в текущую команду
+
+    user: Mapped[User] = relationship()
+
+
+class TeamRequest(Base):
+    """Приглашение от капитана (invite) или заявка участника в команду (join)."""
+
+    __tablename__ = "team_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hackathon_id: Mapped[int] = mapped_column(ForeignKey("hackathons.id"), index=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.tg_id"), index=True)
+    kind: Mapped[str] = mapped_column(String(8))  # invite | join
+    # pending -> accepted | declined | cancelled
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+    user: Mapped[User] = relationship()
+    team: Mapped[Team] = relationship()
 
 
 class HackathonSubmission(Base):
@@ -184,6 +238,7 @@ class HackathonSubmission(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     hackathon_id: Mapped[int] = mapped_column(ForeignKey("hackathons.id"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.tg_id"), index=True)
+    team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id"), index=True)  # в командном хакатоне
     file_path: Mapped[str] = mapped_column(String(500))
     file_name: Mapped[str] = mapped_column(String(256), default="")
     status: Mapped[str] = mapped_column(String(16), default="done")  # done | error
@@ -220,3 +275,6 @@ def _add_missing_columns(sync_conn) -> None:
             if col.name not in existing:
                 col_type = col.type.compile(dialect=sync_conn.dialect)
                 sync_conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {col_type}'))
+        # Индексы на новые колонки (create_all создаёт их только для новых таблиц)
+        for idx in table.indexes:
+            idx.create(sync_conn, checkfirst=True)

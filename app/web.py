@@ -44,6 +44,27 @@ class QuizAnswersIn(BaseModel):
     answers: dict[str, str | list[str] | None] = {}
 
 
+class TeamNameIn(BaseModel):
+    name: str
+
+
+class PoolIn(BaseModel):
+    intent: str = "pool"  # pool — «нет команды», join — «ищу свою команду»
+
+
+class InviteIn(BaseModel):
+    user_id: int
+
+
+class MoveIn(BaseModel):
+    user_id: int
+    team_id: int | None = None
+
+
+class DecisionIn(BaseModel):
+    action: str  # accept | decline | cancel
+
+
 def participant_view(d: dict, sub) -> dict:
     """Участнику до дедлайна не отдаём правильные ответы теста."""
     if sub.kind == "quiz" and d.get("result") and not reference_available(sub.assignment):
@@ -325,6 +346,65 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         await get_hackathon(hid, user)
         return await hacks.leaderboard(hid, user.id)
 
+    # ---------- команды ----------
+
+    teams = hacks.teams
+
+    async def team_call(coro):
+        try:
+            return await coro
+        except ServiceError as e:
+            raise err(e)
+
+    @api.get("/hackathons/{hid}/team")
+    async def my_team(hid: int, user: UserDep):
+        return await team_call(teams.state(hid, user.id))
+
+    @api.post("/hackathons/{hid}/team")
+    async def create_team(hid: int, body: TeamNameIn, user: UserDep):
+        return await team_call(teams.create_team(hid, user.id, body.name))
+
+    @api.patch("/hackathons/{hid}/team")
+    async def rename_team(hid: int, body: TeamNameIn, user: UserDep):
+        return await team_call(teams.rename(hid, user.id, body.name))
+
+    @api.post("/hackathons/{hid}/team/leave")
+    async def leave_team(hid: int, user: UserDep):
+        return await team_call(teams.leave(hid, user.id))
+
+    @api.post("/hackathons/{hid}/team/members/{uid}/remove")
+    async def remove_member(hid: int, uid: int, user: UserDep):
+        await team_call(teams.remove_member(hid, user.id, uid))
+        return {"ok": True}
+
+    @api.post("/hackathons/{hid}/team/invites")
+    async def invite(hid: int, body: InviteIn, user: UserDep):
+        return await team_call(teams.invite(hid, user.id, body.user_id))
+
+    @api.get("/hackathons/{hid}/people")
+    async def people_search(hid: int, user: UserDep, q: str = ""):
+        return await team_call(teams.search_people(hid, user.id, q))
+
+    @api.post("/hackathons/{hid}/pool")
+    async def join_pool(hid: int, body: PoolIn, user: UserDep):
+        return await team_call(teams.register(hid, user.id, body.intent))
+
+    @api.delete("/hackathons/{hid}/pool")
+    async def leave_pool(hid: int, user: UserDep):
+        return await team_call(teams.unregister(hid, user.id))
+
+    @api.get("/hackathons/{hid}/teams")
+    async def team_list(hid: int, user: UserDep, q: str = ""):
+        return await team_call(teams.list_teams(hid, user.id, q))
+
+    @api.post("/hackathons/{hid}/teams/{tid}/requests")
+    async def join_request(hid: int, tid: int, user: UserDep):
+        return await team_call(teams.request_join(hid, user.id, tid))
+
+    @api.post("/team-requests/{rid}")
+    async def decide_request(rid: int, body: DecisionIn, user: UserDep):
+        return await team_call(teams.decide(rid, user.id, body.action))
+
     # ---------- админка ----------
 
     @api.post("/admin/assignments")
@@ -488,9 +568,13 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         task: UploadFile | None = File(None),
         description: Annotated[str, Form()] = "",
         daily_limit: Annotated[int, Form()] = 5,
+        team_mode: Annotated[bool, Form()] = False,
+        team_max: Annotated[int | None, Form()] = None,
+        team_deadline: Annotated[str, Form()] = "",
     ):
         try:
             h = await hacks.create(
+                team_mode=team_mode, team_max=team_max, team_deadline=parse_dt(team_deadline, "время формирования команд"),
                 title=title, description=description,
                 starts_at=parse_dt(starts_at, "начало"), ends_at=parse_dt(ends_at, "окончание"),
                 metric=metric, id_column=id_column, target_column=target_column, daily_limit=daily_limit,
@@ -514,6 +598,9 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         target_column: Annotated[str | None, Form()] = None,
         daily_limit: Annotated[int | None, Form()] = None,
         is_active: Annotated[bool | None, Form()] = None,
+        team_mode: Annotated[bool | None, Form()] = None,
+        team_max: Annotated[int | None, Form()] = None,
+        team_deadline: Annotated[str | None, Form()] = None,
         train: UploadFile | None = File(None),
         test: UploadFile | None = File(None),
         solution: UploadFile | None = File(None),
@@ -526,6 +613,7 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
                 starts_at=parse_dt(starts_at, "начало"), ends_at=parse_dt(ends_at, "окончание"),
                 metric=metric or None, id_column=id_column or None, target_column=target_column or None,
                 daily_limit=daily_limit, is_active=is_active,
+                team_mode=team_mode, team_max=team_max, team_deadline=opt_dt(team_deadline, "время формирования команд"),
                 train=await upload(train), test=await upload(test), solution=await upload(solution),
                 baseline=await upload(baseline), task=await upload(task),
             )
@@ -536,6 +624,32 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
     @api.get("/admin/hackathons/{hid}/submissions")
     async def hackathon_all_submissions(hid: int, user: AdminDep):
         return await hacks.all_submissions(hid)
+
+    @api.get("/admin/hackathons/{hid}/teams")
+    async def hackathon_teams(hid: int, user: AdminDep):
+        return await team_call(teams.overview(hid))
+
+    @api.post("/admin/hackathons/{hid}/teams/form")
+    async def form_teams(hid: int, user: AdminDep):
+        h = await hacks.get(hid)
+        if not h.team_mode:
+            raise HTTPException(400, "Это не командный хакатон")
+        if h.teams_formed:
+            raise HTTPException(400, "Команды уже сформированы")
+        return {"placed": await teams.form_teams(hid)}
+
+    @api.get("/admin/hackathons/{hid}/people")
+    async def admin_people(hid: int, user: AdminDep, q: str = ""):
+        return await team_call(teams.admin_search(hid, q))
+
+    @api.post("/admin/hackathons/{hid}/teams/move")
+    async def admin_move(hid: int, body: MoveIn, user: AdminDep):
+        """Поставить человека в команду (team_id) или убрать из команды, оставив без команды (team_id = null)."""
+        return await team_call(teams.admin_move(hid, body.user_id, body.team_id))
+
+    @api.post("/admin/hackathons/{hid}/teams/{tid}/captain")
+    async def admin_captain(hid: int, tid: int, body: InviteIn, user: AdminDep):
+        return await team_call(teams.admin_set_captain(hid, tid, body.user_id))
 
     @api.get("/admin/participants")
     async def participants(user: AdminDep):
