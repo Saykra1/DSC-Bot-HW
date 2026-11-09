@@ -52,6 +52,11 @@ const I = {
   edit: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z",
   eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
   table: "M3 3h18v18H3zM3 9h18M3 15h18M9 3v18",
+  userPlus: "M15 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M8.5 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM19 8v6M22 11h-6",
+  dice: "M6 3h12a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3zM8.5 8.5h.01M15.5 8.5h.01M12 12h.01M8.5 15.5h.01M15.5 15.5h.01",
+  crown: "M4 19h16M4 8l4.5 4L12 5l3.5 7L20 8l-1.5 8h-13z",
+  logout: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9",
+  mail: "M3 5h18v14H3zM3 7l9 6 9-6",
 };
 const ic = (name, size = 20, sw = 1.8) =>
   `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${I[name]}"/></svg>`;
@@ -217,6 +222,7 @@ async function show(route, { push = true, anim } = {}) {
     stack.push(route);
   }
   clearTimers();
+  closeSheet();
   const my = ++seq;
   const depth = stack.length;
   $("#app").classList.toggle("deep", depth > 1);
@@ -679,12 +685,12 @@ function hackListRoute() {
         return head + emptyState("trophy", "Ближайших хакатонов нет", "Когда организаторы объявят хакатон, бот напишет в чат.");
       let html = head;
       for (const h of running) html += await hackBody(h, get);
-      for (const h of upcoming) html += upcomingCard(h);
+      for (const h of upcoming) html += upcomingCard(h) + (await teamSection(h, get));
       if (finished.length) html += `<span class="h3">Прошедшие</span><div class="list-grid">${finished.map((h) => `
         <a class="capsule" href="#" onclick="event.preventDefault();hap();show(hackRoute(${h.id}))">
           <span class="dot">${ic("trophy", 20, 2)}</span>
           <span class="grow stack" style="gap:0"><span class="h3 ellipsis">${esc(h.title)}</span>
-            <span class="small muted">${dm(h.starts_at)} – ${dm(h.ends_at)}${h.my_best !== null ? ` · твой лучший ${num(h.my_best)}` : ""}</span></span>
+            <span class="small muted">${dm(h.starts_at)} – ${dm(h.ends_at)}${h.team ? ` · «${esc(h.team.name)}»` : ""}${h.my_best !== null ? ` · ${h.team ? "лучший" : "твой лучший"} ${num(h.my_best)}` : ""}</span></span>
           <span class="chev">${ic("chev", 16)}</span></a>`).join("")}</div>`;
       return html;
     },
@@ -693,11 +699,11 @@ function hackListRoute() {
 }
 function upcomingCard(h) {
   return `<div class="card inverse" style="border-radius:32px;padding:22px 20px;gap:14px">
-    <span class="chip solid big" style="align-self:flex-start">Ближайший хакатон</span>
+    <span class="row wrap" style="gap:6px"><span class="chip solid big">Ближайший хакатон</span>${h.team_mode ? `<span class="chip big" style="background:var(--inverse-soft);color:inherit">${ic("users", 14, 2)}командный · до ${h.team_max}</span>` : ""}</span>
     <span class="h2" style="font-size:28px">${esc(h.title)}</span>
     <span style="font-size:14px">Пройдёт с <b>${msk(h.starts_at)}</b> по <b>${msk(h.ends_at)}</b>.</span>
     <div class="grid-3" data-countdown="${esc(h.starts_at)}">${countdownTiles(h.starts_at)}</div>
-    <span class="small" style="opacity:.75">Условие и данные появятся здесь в момент старта. Бот напишет, когда хакатон начнётся.</span>
+    <span class="small" style="opacity:.75">Условие и данные появятся здесь в момент старта. Бот напишет, когда хакатон начнётся.${h.team_mode && !ME.is_admin ? " А команду собери уже сейчас — ниже." : ""}</span>
     ${adminHackActions(h, true)}</div>`;
 }
 function countdownTiles(iso) {
@@ -728,8 +734,10 @@ function hackRoute(id) {
 }
 async function hackBody(h, get) {
   const sub = HSUB[h.id] || "lb";
-  const [lb, mine] = await Promise.all([get(`/hackathons/${h.id}/leaderboard`), get(`/hackathons/${h.id}/submissions`)]);
+  const [lb, mine, teamHtml] = await Promise.all([get(`/hackathons/${h.id}/leaderboard`), get(`/hackathons/${h.id}/submissions`), teamSection(h, get)]);
   const me = lb.find((r) => r.is_me);
+  const teamMode = h.team_mode;
+  const needTeam = teamMode && !ME.is_admin && h.team_state !== "team";
   const status = h.status === "running"
     ? `<span class="chip solid big">Идёт · ещё <span data-left="${esc(h.ends_at)}">${left(h.ends_at)}</span></span>`
     : h.status === "upcoming" ? `<span class="chip accent big">Скоро · старт ${msk(h.starts_at)}</span>` : `<span class="chip big">Завершён</span>`;
@@ -739,35 +747,39 @@ async function hackBody(h, get) {
   const tiles = `<div class="grid-3">
     <div class="tile"><span class="k">лучший</span><span class="v mono">${num(h.my_best)}</span></div>
     <div class="tile"><span class="k">место</span><span class="v">${me ? me.place : "—"}<span class="small muted"> / ${lb.length}</span></span></div>
-    <div class="tile"><span class="k">сегодня</span><span class="v">${h.used_today}<span class="small muted"> / ${h.daily_limit}</span></span></div></div>`;
-  const submit = h.status === "running" ? `<label class="btn primary block press" style="position:relative;overflow:hidden">
+    <div class="tile"><span class="k">${teamMode ? "сегодня, команда" : "сегодня"}</span><span class="v">${h.used_today}<span class="small muted"> / ${h.daily_limit}</span></span></div></div>`;
+  const waitForm = teamMode && !h.teams_formed && h.status === "running";
+  const submit = needTeam ? "" : waitForm && !ME.is_admin ? `<div class="btn block" style="opacity:.6;pointer-events:none">${ic("lock", 18, 2)}Отправка откроется после формирования команд</div>` : h.status === "running" ? `<label class="btn primary block press" style="position:relative;overflow:hidden">
       ${ic("upload", 18, 2)}<span id="hsend-${h.id}">Отправить .csv</span>
       <input type="file" accept=".csv,.txt" style="position:absolute;inset:0;opacity:0;cursor:pointer" onchange="submitHack(${h.id}, this)"></label>
-    <span class="small muted">Колонки <b class="mono">${esc(h.id_column)}</b> и <b class="mono">${esc(h.target_column)}</b>, строка на каждый id из test. Ошибочные файлы не тратят попытку. Можно прислать .csv и прямо в чат с ботом.</span>` : "";
+    <span class="small muted">Колонки <b class="mono">${esc(h.id_column)}</b> и <b class="mono">${esc(h.target_column)}</b>, строка на каждый id из test. Ошибочные файлы не тратят попытку.${teamMode ? " Лимит попыток общий на команду." : ""} Можно прислать .csv и прямо в чат с ботом.</span>` : "";
   const seg = `<div class="seg" role="tablist">
-    <button class="${sub === "mine" ? "on" : ""}" onclick="HSUB[${h.id}]='mine';hap('select');reload()">Мои решения</button>
+    <button class="${sub === "mine" ? "on" : ""}" onclick="HSUB[${h.id}]='mine';hap('select');reload()">${teamMode ? "Решения команды" : "Мои решения"}</button>
     <button class="${sub === "lb" ? "on" : ""}" onclick="HSUB[${h.id}]='lb';hap('select');reload()">Лидерборд</button></div>`;
   const board = lb.length ? `<div class="stack" style="gap:6px">${lb.map((r) => `
       <div class="lb-row${r.is_me ? " me" : ""}${r.place <= 3 ? " top" : ""}"><span class="place">${r.place}</span>
-        <span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${esc(r.name)}${r.is_me ? " (ты)" : ""}</span>
-          ${r.user ? `<span class="small" style="opacity:.7">${esc(r.user.fio || "ФИО не указано")}${r.user.username ? " · @" + esc(r.user.username) : ""}</span>` : ""}</span>
+        <span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${esc(r.name)}${r.is_me ? (r.members ? " (вы)" : " (ты)") : ""}</span>
+          ${r.users ? `<span class="small ellipsis" style="opacity:.7">${r.users.map((u) => esc(u.fio || u.name)).join(", ")}</span>`
+            : r.members ? `<span class="small ellipsis" style="opacity:.7">${r.members.map(esc).join(", ")}</span>`
+            : r.user ? `<span class="small" style="opacity:.7">${esc(r.user.fio || "ФИО не указано")}${r.user.username ? " · @" + esc(r.user.username) : ""}</span>` : ""}</span>
         <span class="small" style="opacity:.7">${r.attempts} ${plural(r.attempts, "попытка", "попытки", "попыток")}</span><span class="sc">${num(r.score)}</span></div>`).join("")}</div>
-      <span class="small muted">В зачёт идёт лучший результат. При равенстве выше тот, кто отправил раньше.</span>`
+      <span class="small muted">В зачёт идёт лучший результат${teamMode ? " команды" : ""}. При равенстве выше тот, кто отправил раньше.</span>`
     : `<p class="muted" style="text-align:center">Пока нет ни одного решения</p>`;
   const mineList = mine.length ? `<div class="stack" style="gap:6px">${[...mine].reverse().map((x) => `
       <div class="capsule round" style="padding:6px 16px 6px 6px"><span class="avatar sm plain" style="font:600 12px var(--font)">№${x.number}</span>
         <span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${esc(x.file_name)}</span>
-          <span class="small muted">${when(x.created_at)}${x.status === "done" && x.score === h.my_best ? " · лучший" : ""}${x.status !== "done" ? " · " + esc(x.error || "ошибка") : ""}</span></span>
+          <span class="small muted">${x.author ? (x.is_mine ? "ты · " : esc(x.author) + " · ") : ""}${when(x.created_at)}${x.status === "done" && x.score === h.my_best ? " · лучший" : ""}${x.status !== "done" ? " · " + esc(x.error || "ошибка") : ""}</span></span>
         <span class="mono small ${x.status === "done" ? (x.score === h.my_best ? "c-good" : "") : "c-bad"}" style="font-size:13px">${x.status === "done" ? num(x.score) : "ошибка"}</span></div>`).join("")}</div>`
     : `<p class="muted" style="text-align:center">Решений пока нет</p>`;
   return `<div class="stack" style="gap:14px">
     <div class="stack" style="gap:6px"><div class="row between">${status}<span class="small muted">${h.status === "running" ? "до " + msk(h.ends_at) : ""}</span></div>
       <span class="h1">${esc(h.title)}</span>
       <span class="small muted">Метрика: ${esc(h.metric_title)}, ${h.higher_is_better ? "больше" : "меньше"} — лучше</span></div>
+    ${teamHtml}
     ${h.description ? `<details class="acc"${h.my_count ? "" : " open"}><summary><span class="n" style="background:var(--bg)">${ic("doc", 18, 2)}</span><span class="grow h3">Условие</span><span class="chev">${ic("chev", 16)}</span></summary>
       <div class="body pre" style="padding-left:16px">${esc(h.description)}</div></details>` : ""}
     ${files ? `<div class="row wrap" style="gap:6px">${files}</div>` : ""}
-    ${tiles}${submit}${seg}${sub === "lb" ? board : mineList}${adminHackActions(h)}</div>`;
+    ${needTeam ? "" : tiles}${submit}${needTeam && h.status === "upcoming" ? "" : `${needTeam ? `<span class="h3">Лидерборд</span>` : seg}${sub === "lb" || needTeam ? board : mineList}`}${adminHackActions(h)}</div>`;
 }
 async function submitHack(id, input) {
   if (!input.files.length) return;
@@ -781,6 +793,442 @@ async function submitHack(id, input) {
     HSUB[id] = "mine";
     reload();
   } catch (e) { toast(e.message, "err"); lbl.textContent = "Отправить .csv"; input.value = ""; }
+}
+
+// ---------- команды ----------
+const teamInitials = (name) => String(name || "?").trim().split(/\s+/).map((w) => (w.match(/[\p{L}\p{N}]/u) || [""])[0]).filter(Boolean).slice(0, 2).join("").toUpperCase() || "?";
+const tgLink = (u) => (u ? `<a class="tg-link" href="https://t.me/${esc(u)}" target="_blank" rel="noopener" onclick="event.stopPropagation();return openTg('${esc(u)}')">@${esc(u)}</a>` : "");
+function openTg(u) {
+  if (tg?.openTelegramLink) { tg.openTelegramLink(`https://t.me/${u}`); return false; }
+  return true;
+}
+const sizeDots = (n, max) => `<span class="size-dots" aria-label="${n} из ${max}">${Array.from({ length: max }, (_, i) => `<i class="${i < n ? "on" : ""}"></i>`).join("")}</span>`;
+const people = (n) => `${n} ${plural(n, "человек", "человека", "человек")}`;
+
+async function teamSection(h, get) {
+  if (!h.team_mode) return "";
+  if (ME.is_admin) return adminTeamStrip(h);
+  if (h.status === "finished" && h.team_state !== "team") return "";
+  const t = await get(`/hackathons/${h.id}/team`);
+  const finished = h.status === "finished";
+  const head = `<div class="row between" style="gap:8px"><span class="chip accent big">${ic("users", 14, 2)}Командный · до ${people(t.team_max)}</span>
+    <span class="small muted" style="text-align:right;white-space:nowrap">${t.formed ? `${ic("lock", 12, 2)} составы закреплены` : `команды до ${dm(t.deadline)}, ${hm(t.deadline)}`}</span></div>`;
+  const invites = t.invites.map((x) => `<div class="invite">
+      <span class="team-ava sm">${esc(teamInitials(x.team_name))}</span>
+      <span class="grow stack" style="gap:0"><span class="h3 ellipsis">${esc(x.team_name)}</span>
+        <span class="small ellipsis" style="opacity:.7">${ic("mail", 12, 2)} зовёт ${x.captain ? esc(x.captain) : "капитан"} · ${x.size}/${t.team_max}</span></span>
+      <button class="btn xs primary" onclick="decideReq(${x.id},'accept',this)">Вступить</button>
+      <button class="icon-btn sm" aria-label="Отклонить" onclick="decideReq(${x.id},'decline',this)">${ic("close", 16, 2)}</button></div>`).join("");
+
+  if (t.state === "team") return `<section class="stack" style="gap:10px">${head}${invites}${teamCard(h, t, finished)}</section>`;
+
+  const left_ = t.formed ? "" : `<span data-left="${esc(t.deadline)}">${left(t.deadline)}</span>`;
+  if (t.state === "pool" && t.intent === "pool") {
+    return `<section class="stack" style="gap:10px">${head}${invites}
+      <div class="team-card pool">
+        <div class="team-head"><span class="team-ava ghost">${ic("dice", 26, 1.8)}</span>
+          <span class="grow stack" style="gap:2px"><span class="h2" style="font-size:18px">Ищем тебе команду</span>
+          <span class="small muted">Через ${left_} всех без команды распределим случайно — по ${t.team_max > 2 ? "ровным " : ""}командам до ${people(t.team_max)}.</span></span></div>
+        <span class="small muted">Пока можно передумать: создать свою команду или попроситься в чужую. Бот напишет, когда тебя распределят.</span>
+        <div class="row wrap" style="gap:6px">
+          <button class="btn sm" style="background:var(--bg)" onclick="hap();show(teamCreateRoute(${h.id}))">${ic("plus", 16, 2.2)}Создать свою</button>
+          <button class="btn sm" style="background:var(--bg)" onclick="hap();show(teamFindRoute(${h.id}))">${ic("search", 16, 2)}Найти команду</button>
+          <span class="grow"></span>
+          <button class="btn xs ghost" onclick="leavePool(${h.id}, this)">Не участвую</button></div></div></section>`;
+  }
+  const waiting = t.my_requests.length ? `<div class="team-card">
+      <div class="row between"><span class="h3">Ждём ответа капитана</span><span class="small muted">${t.my_requests.length} ${plural(t.my_requests.length, "заявка", "заявки", "заявок")}</span></div>
+      ${t.my_requests.map((x) => `<div class="member"><span class="team-ava sm">${esc(teamInitials(x.team_name))}</span>
+        <span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${esc(x.team_name)}</span>
+          <span class="small muted ellipsis">${x.size} из ${t.team_max}${x.captain ? " · капитан " + esc(x.captain) : ""}</span></span>
+        <span class="chip warn">ждём</span>
+        <button class="icon-btn sm" aria-label="Отменить заявку" onclick="decideReq(${x.id},'cancel',this)">${ic("close", 16, 2)}</button></div>`).join("")}
+      <span class="small muted">${t.formed ? "Если не возьмут — выбери «Нет команды», и мы сразу найдём тебе команду."
+        : `Если до ${msk(t.deadline)} тебя не возьмут, мы распределим тебя в случайную команду.`}</span></div>` : "";
+  const choice = (key, icon, title, sub, primary) => `<button class="choice press${primary ? " primary" : ""}" onclick="teamChoice(${h.id},'${key}',this)">
+      <span class="choice-ic">${ic(icon, 24, 2)}</span>
+      <span class="grow stack" style="gap:1px"><span class="h3">${title}</span><span class="small muted">${sub}</span></span>
+      <span class="chev">${ic("chev", 16)}</span></button>`;
+  return `<section class="stack" style="gap:10px">${head}${invites}${waiting}
+    <div class="stack" style="gap:8px">
+      <span class="h2">${t.my_requests.length ? "Или выбери другое" : "Как будешь участвовать?"}</span>
+      <div class="choices">
+        ${choice("create", "crown", "Создать команду", "станешь капитаном и позовёшь людей", !t.my_requests.length)}
+        ${choice("join", "search", "Вступить в команду", "найди по названию — капитан подтвердит")}
+        ${choice("pool", "dice", "Нет команды", t.formed ? "сразу добавим в случайную команду" : "распределим случайно к таким же")}
+      </div>
+      ${h.status !== "upcoming" ? `<span class="small muted" style="padding:0 6px">Решения в командном хакатоне отправляет команда, поэтому сначала выбери вариант выше.</span>` : ""}
+    </div></section>`;
+}
+
+function teamCard(h, t, finished) {
+  const team = t.team;
+  const cap = team.is_captain;
+  const canEdit = !finished && !t.formed;
+  const member = (m) => `<div class="member${m.is_me ? " me" : ""}">
+      <span class="avatar sm${m.is_captain ? "" : " plain"}">${esc(initial(m.name))}</span>
+      <span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${esc(m.name)}${m.is_me ? " (ты)" : ""}</span>
+        <span class="small muted ellipsis">${m.is_captain ? `${ic("crown", 12, 2)} капитан${m.username ? " · " : ""}` : ""}${tgLink(m.username)}</span></span>
+      ${cap && canEdit && !m.is_me ? `<button class="icon-btn sm" aria-label="Убрать из команды" onclick='removeMember(${h.id},${m.tg_id},${esc(JSON.stringify(m.name))})'>${ic("close", 16, 2)}</button>` : ""}</div>`;
+  const free = t.team_max - team.size;
+  const slots = !finished && free > 0 ? Array.from({ length: Math.min(free, cap ? free : 1) }, () => cap
+    ? `<button class="member slot press" onclick="hap();show(teamInviteRoute(${h.id}))"><span class="slot-ic">${ic("plus", 16, 2.2)}</span><span class="small">Пригласить</span></button>`
+    : `<div class="member slot"><span class="slot-ic">${ic("plus", 16, 2.2)}</span><span class="small">ещё ${free} ${plural(free, "место", "места", "мест")}</span></div>`).join("") : "";
+  const reqRow = (r, kind) => `<div class="member">
+      <span class="avatar sm plain">${esc(initial(r.name))}</span>
+      <span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${esc(r.name)}</span>
+        <span class="small muted ellipsis">${tgLink(r.username) || when(r.created_at)}</span></span>
+      ${kind === "join" ? `<button class="btn xs primary" onclick="decideReq(${r.id},'accept',this)"${free > 0 ? "" : " disabled"}>Принять</button>
+        <button class="icon-btn sm" aria-label="Отклонить" onclick="decideReq(${r.id},'decline',this)">${ic("close", 16, 2)}</button>`
+        : `<span class="chip">ждём</span><button class="icon-btn sm" aria-label="Отменить приглашение" onclick="decideReq(${r.id},'cancel',this)">${ic("close", 16, 2)}</button>`}</div>`;
+  const requests = cap && team.requests?.length && !finished ? `<div class="team-sub">
+      <span class="small muted" style="font-weight:600">Хотят в команду · ${team.requests.length}</span>${team.requests.map((r) => reqRow(r, "join")).join("")}</div>` : "";
+  const sentInv = cap && team.invites_sent?.length && !finished ? `<div class="team-sub">
+      <span class="small muted" style="font-weight:600">Приглашены · ждём ответа</span>${team.invites_sent.map((r) => reqRow(r, "invite")).join("")}</div>` : "";
+  const note = finished ? "" : t.formed ? "Составы закреплены до конца хакатона. Если нужно что-то поменять, напиши организаторам."
+    : `До ${msk(t.deadline)} состав можно менять. Потом он закрепится до конца хакатона, и откроется отправка решений.`;
+  return `<div class="team-card">
+    <div class="team-head"><span class="team-ava">${esc(teamInitials(team.name))}</span>
+      <span class="grow stack" style="gap:2px"><span class="small muted">${team.is_auto ? "Сборная · собрана случайно" : "Твоя команда"}</span>
+        <span class="h2 ellipsis">${esc(team.name)}</span></span>
+      ${cap && !finished ? `<button class="icon-btn sm" aria-label="Переименовать" onclick="hap();show(teamCreateRoute(${h.id}, ${esc(JSON.stringify(team.name))}))">${ic("edit", 16, 2)}</button>` : ""}</div>
+    <div class="row" style="gap:10px">${sizeDots(team.size, t.team_max)}<span class="small muted" style="white-space:nowrap">${team.size} из ${t.team_max}${cap ? " · ты капитан" : ""}</span></div>
+    <div class="members">${team.members.map(member).join("")}${slots}</div>
+    ${requests}${sentInv}
+    ${!finished ? `<div class="row wrap" style="gap:6px">
+      ${cap && free > 0 ? `<button class="btn sm primary" onclick="hap();show(teamInviteRoute(${h.id}))">${ic("userPlus", 16, 2)}Пригласить</button>` : ""}
+      <span class="grow"></span>
+      ${canEdit ? `<button class="btn xs ghost" onclick="leaveTeam(${h.id}, ${team.size}, ${cap})">${ic("logout", 14, 2)}Выйти из команды</button>` : ""}</div>
+      <span class="small muted">${note}</span>` : ""}</div>`;
+}
+
+function adminTeamStrip(h) {
+  return `<button class="capsule press" onclick="hap();show(teamsAdminRoute(${h.id}))">
+    <span class="dot" style="background:var(--accent-soft);color:var(--accent-ink)">${ic("users", 20, 2)}</span>
+    <span class="grow stack" style="gap:0"><span class="h3">Команды</span>
+      <span class="small muted">до ${people(h.team_max)} · ${h.teams_formed ? "составы закреплены" : "формируются до " + msk(h.team_deadline)}</span></span>
+    <span class="chev">${ic("chev", 16)}</span></button>`;
+}
+
+async function teamCall(path, opts, okText, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api(path, opts);
+    if (okText) toast(typeof okText === "function" ? okText(r) : okText);
+    return r;
+  } catch (e) { toast(e.message, "err"); if (btn) btn.disabled = false; throw e; }
+}
+async function teamChoice(hid, key, btn, back = false) {
+  hap();
+  if (key === "create") return show(teamCreateRoute(hid));
+  if (key === "join") return show(teamFindRoute(hid));
+  try {
+    const r = await teamCall(`/hackathons/${hid}/pool`, json("POST", { intent: "pool" }), null, btn);
+    toast(r.state === "team" ? `Ты в команде «${r.team.name}»` : "Готово — распределим тебя, когда придёт время");
+    back ? goBack() : reload();
+  } catch {}
+}
+async function leavePool(hid, btn) {
+  if (!confirm("Не участвовать в хакатоне? Выбрать команду можно будет снова.")) return;
+  try { await teamCall(`/hackathons/${hid}/pool`, { method: "DELETE" }, "Ок, ты не участвуешь", btn); reload(); } catch {}
+}
+async function decideReq(rid, action, btn) {
+  hap(action === "accept" ? "medium" : "light");
+  const ok = { accept: "Готово", decline: "Отклонено", cancel: "Отменено" }[action];
+  try {
+    const r = await teamCall(`/team-requests/${rid}`, json("POST", { action }), (x) =>
+      action === "accept" ? (x.kind === "invite" ? `Ты в команде «${x.team_name}»` : `${x.user_name} теперь в команде`) : ok, btn);
+    if (r) reload();
+  } catch { reload(); }
+}
+async function leaveTeam(hid, size, captain) {
+  const msg = size <= 1 ? "Выйти? Команда распадётся." : captain ? "Выйти из команды? Капитаном станет следующий участник." : "Выйти из команды?";
+  if (!confirm(msg)) return;
+  try { await teamCall(`/hackathons/${hid}/team/leave`, { method: "POST" }, "Ты вышел из команды"); reload(); } catch {}
+}
+async function removeMember(hid, uid, name) {
+  if (!confirm(`Убрать ${name} из команды?`)) return;
+  try { await teamCall(`/hackathons/${hid}/team/members/${uid}/remove`, { method: "POST" }, `${name} больше не в команде`); reload(); } catch {}
+}
+
+function teamCreateRoute(hid, currentName = null) {
+  const rename = currentName !== null;
+  return {
+    fresh: true,
+    async render(get) {
+      const h = await get(`/hackathons/${hid}`);
+      return `${topbar(rename ? "Название команды" : "Новая команда", esc(h.title))}
+        <form id="team-form" class="stack narrow" style="gap:14px" novalidate>
+          ${rename ? "" : `<div class="card tight soft-accent" style="gap:8px">
+            <span class="row" style="gap:10px;align-items:flex-start">${ic("crown", 18, 2)}<span class="grow small" style="font-size:13px">
+              Ты станешь капитаном: сможешь звать людей по нику, @username или ФИО и принимать заявки. В команде — до ${people(h.team_max)}.</span></span></div>`}
+          <div class="team-preview"><span class="team-ava lg" id="tp-ava">${esc(teamInitials(currentName || "?"))}</span>
+            <span class="small muted">так команду увидят в лидерборде</span></div>
+          <label class="field"><span>Название</span>
+            <input class="input big" name="name" maxlength="40" autocomplete="off" value="${esc(currentName || "")}" placeholder="Например, Нейро коты"></label>
+          <div class="cta"><button class="btn primary" type="submit" id="team-save">${rename ? "Сохранить" : "Создать команду"}</button></div></form>`;
+    },
+    after() {
+      const f = $("#team-form");
+      const inp = f.elements.name;
+      inp.addEventListener("input", () => { $("#tp-ava").textContent = teamInitials(inp.value || "?"); f.setAttribute("data-dirty", ""); });
+      if (!rename) setTimeout(() => inp.focus(), 250);
+      f.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const name = inp.value.trim();
+        if (name.length < 2) { toast("Название — хотя бы 2 символа", "err"); inp.focus(); return; }
+        try {
+          await teamCall(`/hackathons/${hid}/team`, json(rename ? "PATCH" : "POST", { name }),
+            rename ? "Название сохранено" : `Команда «${name}» создана — зови людей`, $("#team-save"));
+          f.removeAttribute("data-dirty");
+          goBack();
+        } catch {}
+      };
+    },
+  };
+}
+
+let TEAM_Q = "";
+function teamFindRoute(hid) {
+  return {
+    fresh: true,
+    async render(get) {
+      const [h, list] = await Promise.all([get(`/hackathons/${hid}`), get(`/hackathons/${hid}/teams`)]);
+      const rows = list.map((t) => `<div class="capsule team-row" data-q="${esc(t.name.toLowerCase())}">
+          <span class="team-ava sm${t.full ? " ghost" : ""}">${esc(teamInitials(t.name))}</span>
+          <span class="grow stack" style="gap:2px"><span class="h3 ellipsis">${esc(t.name)}</span>
+            <span class="row" style="gap:8px">${sizeDots(t.size, h.team_max)}<span class="small muted ellipsis">${t.size}/${h.team_max}${t.captain ? " · " + esc(t.captain) : ""}</span></span></span>
+          ${t.request_id ? `<button class="btn xs" style="background:var(--warn-soft);color:var(--warn)" onclick="decideReq(${t.request_id},'cancel',this)">Ждём · отменить</button>`
+            : t.full ? `<span class="chip">мест нет</span>`
+            : `<button class="btn xs primary" onclick="askJoin(${hid},${t.id},this)">Проситься</button>`}</div>`).join("");
+      return `${topbar("Найти команду", esc(h.title))}
+        <label class="search"><span>${ic("search", 18, 2)}</span><input class="input" id="team-q" placeholder="Название команды" value="${esc(TEAM_Q)}" autocomplete="off"></label>
+        ${list.length ? `<div class="list-grid" id="team-list">${rows}</div><p class="muted hide" id="team-none" style="text-align:center">Такой команды нет. Проверь название у капитана.</p>`
+          : emptyState("users", "Команд пока нет", "Создай свою или выбери «Нет команды» — тогда мы распределим тебя сами.")}
+        <div class="card tight" style="gap:8px"><span class="small muted">Капитан получит заявку в боте и подтвердит её. Не нашёл свою команду?</span>
+          <div class="row wrap" style="gap:6px">
+            <button class="btn xs" style="background:var(--bg)" onclick="replace(teamCreateRoute(${hid}))">${ic("plus", 14, 2.2)}Создать свою</button>
+            ${h.team_state === "none" ? `<button class="btn xs" style="background:var(--bg)" onclick="teamChoice(${hid},'pool',this,true)">${ic("dice", 14, 2)}Нет команды</button>` : ""}</div></div>`;
+    },
+    after() {
+      const inp = $("#team-q");
+      const apply = () => {
+        TEAM_Q = inp.value;
+        const q = inp.value.trim().toLowerCase();
+        let n = 0;
+        $$("#team-list .team-row").forEach((r) => { const on = !q || r.dataset.q.includes(q); r.classList.toggle("hide", !on); n += on; });
+        $("#team-none")?.classList.toggle("hide", n > 0);
+      };
+      inp?.addEventListener("input", apply);
+      if (inp) apply();
+    },
+  };
+}
+async function askJoin(hid, tid, btn) {
+  hap("medium");
+  try {
+    const r = await teamCall(`/hackathons/${hid}/teams/${tid}/requests`, { method: "POST" },
+      (x) => (x.accepted ? "Капитан уже звал тебя — ты в команде!" : "Заявка отправлена капитану"), btn);
+    r.accepted ? goBack() : reload();
+  } catch {}
+}
+
+let INV_Q = "";
+function teamInviteRoute(hid) {
+  return {
+    fresh: true,
+    async render(get) {
+      const [h, t] = await Promise.all([get(`/hackathons/${hid}`), get(`/hackathons/${hid}/team`)]);
+      if (!t.team?.is_captain) throw new Error("Приглашать может только капитан");
+      const free = t.team_max - t.team.size;
+      return `${topbar("Пригласить в команду", esc(t.team.name))}
+        <div class="row" style="gap:10px">${sizeDots(t.team.size, t.team_max)}<span class="small muted" style="white-space:nowrap">${free > 0 ? `свободно ${free} из ${t.team_max}` : "мест нет"}</span></div>
+        <label class="search"><span>${ic("search", 18, 2)}</span><input class="input" id="inv-q" placeholder="Ник, @username или ФИО" value="${esc(INV_Q)}" autocomplete="off" enterkeyhint="search"></label>
+        <div id="inv-results" class="list-grid"></div>
+        <span class="small muted" style="padding:0 6px">Найти можно только тех, кто хоть раз писал боту. Приглашённый получит сообщение с кнопками «Вступить» и «Отклонить».</span>`;
+    },
+    after() {
+      const inp = $("#inv-q");
+      let timer, my = 0;
+      const run = async () => {
+        INV_Q = inp.value;
+        const q = inp.value.trim();
+        const box = $("#inv-results");
+        if (q.replace(/^@/, "").length < 2) { box.innerHTML = `<div class="hint-empty">${ic("search", 28, 1.6)}<span>Начни вводить ник, @username или фамилию</span></div>`; return; }
+        const n = ++my;
+        box.classList.add("loading");
+        try {
+          const list = await api(`/hackathons/${hid}/people?q=${encodeURIComponent(q)}`);
+          if (n !== my) return;
+          box.innerHTML = list.length ? list.map((u) => `<div class="capsule">
+            <span class="avatar sm plain">${esc(initial(u.name))}</span>
+            <span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${esc(u.name)}</span>
+              <span class="small muted ellipsis">${[u.username ? "@" + esc(u.username) : "", esc(u.fio || "")].filter(Boolean).join(" · ") || "&nbsp;"}</span></span>
+            ${u.in_my_team ? `<span class="chip good">в команде</span>`
+              : u.request_id ? `<button class="btn xs primary" onclick="decideReq(${u.request_id},'accept',this)">Принять заявку</button>`
+              : u.team_name ? `<span class="chip ellipsis" style="max-width:40%">в «${esc(u.team_name)}»</span>`
+              : u.invited ? `<span class="chip accent">приглашён</span>`
+              : `<button class="btn xs primary" onclick="inviteUser(${hid},${u.tg_id},this)">${ic("userPlus", 14, 2)}Позвать</button>`}</div>`).join("")
+            : `<div class="hint-empty">${ic("users", 28, 1.6)}<span>Никого не нашли. ФИО ищется от 4 букв; человек должен хоть раз написать боту.</span></div>`;
+        } catch (e) { if (n === my) box.innerHTML = `<p class="small c-bad" style="text-align:center">${esc(e.message)}</p>`; }
+        finally { if (n === my) box.classList.remove("loading"); }
+      };
+      inp.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(run, 250); });
+      run();
+      setTimeout(() => inp.focus(), 250);
+    },
+  };
+}
+async function inviteUser(hid, uid, btn) {
+  hap("medium");
+  try {
+    const r = await teamCall(`/hackathons/${hid}/team/invites`, json("POST", { user_id: uid }),
+      (x) => (x.accepted ? "Он сам просился — уже в команде" : "Приглашение отправлено в бот"), btn);
+    btn.outerHTML = r.accepted ? `<span class="chip good">в команде</span>` : `<span class="chip accent">приглашён</span>`;
+  } catch {}
+}
+
+let ADM_TEAMS = null;
+function teamsAdminRoute(hid) {
+  return {
+    fresh: true,
+    async render(get) {
+      const [h, o] = await Promise.all([get(`/hackathons/${hid}`), get(`/admin/hackathons/${hid}/teams`)]);
+      ADM_TEAMS = { hid, ...o };
+      const members = o.teams.reduce((n, t) => n + t.size, 0);
+      const who = (u) => `<span class="h3 ellipsis" style="font-size:14px">${esc(u.name)}</span>
+        <span class="small muted ellipsis">${esc(u.user?.fio || "ФИО не указано")}${u.username ? " · @" + esc(u.username) : ""}</span>`;
+      const memberRow = (t, m) => `<button class="member press" onclick="admMemberSheet(${t.id},${m.tg_id})">
+          <span class="avatar sm${m.is_captain ? "" : " plain"}">${esc(initial(m.name))}</span>
+          <span class="grow stack" style="gap:0">${who(m)}</span>
+          ${m.is_captain ? `<span class="chip accent">${ic("crown", 12, 2)}капитан</span>` : ""}
+          <span class="chev" style="color:var(--muted)">${ic("chev", 16)}</span></button>`;
+      const teamCards = o.teams.map((t) => `<div class="team-card" style="gap:10px">
+          <div class="team-head"><span class="team-ava sm">${esc(teamInitials(t.name))}</span>
+            <span class="grow stack" style="gap:0"><span class="h3 ellipsis">${esc(t.name)}</span>
+              <span class="small muted">${t.size} из ${o.team_max}${t.is_auto ? " · сборная" : ""}${t.requests?.length ? ` · заявок: ${t.requests.length}` : ""}</span></span>
+            ${sizeDots(t.size, o.team_max)}</div>
+          <div class="stack" style="gap:6px">${t.members.map((m) => memberRow(t, m)).join("")}
+            ${t.size < o.team_max ? `<button class="member slot press" onclick="admAddRoute(${t.id})"><span class="slot-ic">${ic("plus", 16, 2.2)}</span><span class="small">Добавить в команду</span></button>` : ""}</div></div>`).join("");
+      return `${topbar("Команды", esc(h.title))}
+        <div class="grid-3">
+          <div class="tile"><span class="k">команд</span><span class="v">${o.teams.length}</span></div>
+          <div class="tile"><span class="k">в командах</span><span class="v">${members}</span></div>
+          <div class="tile"><span class="k">без команды</span><span class="v ${o.pool.length ? "c-accent" : ""}">${o.pool.length}</span></div></div>
+        ${o.formed ? `<div class="card tight" style="gap:6px"><span class="row" style="gap:10px">${ic("lock", 18, 2)}<span class="h3 grow" style="font-size:14px">Составы закреплены</span></span>
+            <span class="small muted">Участники больше не могут выходить, капитаны — убирать людей. Ты можешь переставлять, добавлять и убирать участников: нажми на человека.</span></div>`
+          : `<div class="card tight soft-accent" style="gap:10px"><span class="row" style="gap:10px;align-items:flex-start">${ic("dice", 18, 2)}<span class="grow small" style="font-size:13px">
+              ${msk(o.deadline)} все без команды (${o.pool.length}) будут случайно распределены по командам до ${people(o.team_max)}, а составы закрепятся. До этого решения не принимаются.</span></span>
+            <button class="btn sm dark" onclick="formTeams(${hid}, this, ${o.pool.length})">${ic("dice", 16, 2)}Сформировать сейчас</button></div>`}
+        <button class="btn sm" style="align-self:flex-start" onclick="admAddRoute(null)">${ic("userPlus", 16, 2)}Найти участника</button>
+        ${o.pool.length ? `<div class="stack" style="gap:6px"><span class="h3">Без команды</span>${o.pool.map((u) => `<button class="member press" style="background:var(--surface)" onclick="admMoveSheet(${u.tg_id}, null)">
+            <span class="avatar sm plain">${esc(initial(u.name))}</span><span class="grow stack" style="gap:0">${who(u)}</span>
+            <span class="chip">${u.intent === "join" ? "ждёт капитана" : o.formed ? "нужна команда" : "распределить"}</span></button>`).join("")}</div>` : ""}
+        ${o.teams.length ? `<span class="h3">Команды</span><div class="list-grid">${teamCards}</div>` : emptyState("users", "Команд пока нет", "Участники создадут команды во вкладке «Хакатоны».")}`;
+    },
+  };
+}
+async function formTeams(hid, btn, n) {
+  if (!confirm(`Распределить ${n} ${plural(n, "человека", "человек", "человек")} без команды и закрепить составы? После этого участники не смогут выходить из команд, а ты сможешь править составы вручную.`)) return;
+  try { const r = await teamCall(`/admin/hackathons/${hid}/teams/form`, { method: "POST" }, (x) => `Распределено: ${x.placed}`, btn); if (r) reload(); } catch {}
+}
+
+// нижняя шторка с действиями
+function openSheet(title, body) {
+  closeSheet();
+  const bg = document.createElement("div");
+  bg.className = "sheet-bg";
+  bg.innerHTML = `<div class="sheet" role="dialog" aria-label="${esc(title)}"><div class="row between" style="padding:0 4px 4px"><span class="h3">${title}</span>
+    <button class="icon-btn sm" aria-label="Закрыть" onclick="closeSheet()">${ic("close", 16, 2)}</button></div>${body}</div>`;
+  bg.addEventListener("click", (e) => { if (e.target === bg) closeSheet(); });
+  document.body.appendChild(bg);
+  hap("light");
+}
+function closeSheet() { $$(".sheet-bg").forEach((x) => x.remove()); }
+const sheetItem = (icon, label, sub, onclick, cls = "") => `<button class="member sheet-item press ${cls}" onclick="${onclick}">
+  <span class="slot-ic">${ic(icon, 16, 2)}</span><span class="grow stack" style="gap:0"><span class="h3" style="font-size:14px">${label}</span>${sub ? `<span class="small muted">${sub}</span>` : ""}</span></button>`;
+
+function admFind(uid) {
+  for (const t of ADM_TEAMS.teams) { const m = t.members.find((x) => x.tg_id === uid); if (m) return { t, m }; }
+  const m = ADM_TEAMS.pool.find((x) => x.tg_id === uid);
+  return { t: null, m };
+}
+function admMemberSheet(tid, uid) {
+  const { t, m } = admFind(uid);
+  if (!m) return;
+  openSheet(esc(m.name), `<span class="small muted" style="padding:0 6px 6px">${esc(t.name)} · ${esc(m.user?.fio || "ФИО не указано")}${m.username ? " · @" + esc(m.username) : ""}</span>
+    ${sheetItem("users", "Перевести в другую команду", "освободит место здесь", `admMoveSheet(${uid}, ${tid})`)}
+    ${m.is_captain ? "" : sheetItem("crown", "Сделать капитаном", "сможет звать людей и принимать заявки", `admCaptain(${tid}, ${uid})`)}
+    ${sheetItem("logout", "Убрать из команды", "останется в хакатоне без команды", `admMove(${uid}, null, this)`, "danger")}`);
+}
+function admMoveSheet(uid, fromTid, name) {
+  const found = admFind(uid);
+  const label = name || found.m?.name || "участник";
+  const o = ADM_TEAMS;
+  const rows = o.teams.filter((t) => t.id !== fromTid).map((t) => {
+    const full = t.size >= o.team_max;
+    return `<button class="member sheet-item press" ${full ? "disabled" : ""} onclick="admMove(${uid}, ${t.id}, this)">
+      <span class="team-ava sm">${esc(teamInitials(t.name))}</span>
+      <span class="grow stack" style="gap:2px"><span class="h3 ellipsis" style="font-size:14px">${esc(t.name)}</span>
+        <span class="row" style="gap:8px">${sizeDots(t.size, o.team_max)}<span class="small muted">${full ? "мест нет" : `${t.size} из ${o.team_max}`}</span></span></span></button>`;
+  }).join("");
+  openSheet(`Куда перевести: ${esc(label)}`, `<div class="stack sheet-list" style="gap:6px">${rows || `<p class="muted small" style="text-align:center">Других команд нет</p>`}
+    ${fromTid !== null && found.t ? sheetItem("logout", "Без команды", "убрать из команды, оставить в хакатоне", `admMove(${uid}, null, this)`) : ""}</div>`);
+}
+async function admMove(uid, tid, btn) {
+  try {
+    const o = await teamCall(`/admin/hackathons/${ADM_TEAMS.hid}/teams/move`, json("POST", { user_id: uid, team_id: tid }),
+      tid ? "Готово — участник в новой команде, бот ему написал" : "Убран из команды", btn);
+    closeSheet();
+    reload();
+    return o;
+  } catch {}
+}
+async function admCaptain(tid, uid) {
+  try { await teamCall(`/admin/hackathons/${ADM_TEAMS.hid}/teams/${tid}/captain`, json("POST", { user_id: uid }), "Капитан назначен"); closeSheet(); reload(); } catch {}
+}
+function admAddRoute(tid) {
+  const team = tid ? ADM_TEAMS.teams.find((t) => t.id === tid) : null;
+  const hid = ADM_TEAMS.hid;
+  show({
+    fresh: true,
+    async render() {
+      return `${topbar(team ? "Добавить в команду" : "Найти участника", team ? esc(team.name) : "любой, кто писал боту")}
+        <label class="search"><span>${ic("search", 18, 2)}</span><input class="input" id="adm-q" placeholder="Ник, @username или ФИО" autocomplete="off"></label>
+        <div id="adm-results" class="list-grid"></div>`;
+    },
+    after() {
+      const inp = $("#adm-q");
+      let timer, my = 0;
+      const run = async () => {
+        const q = inp.value.trim(), box = $("#adm-results");
+        if (q.replace(/^@/, "").length < 2) { box.innerHTML = `<div class="hint-empty">${ic("search", 28, 1.6)}<span>Начни вводить ник, @username или ФИО</span></div>`; return; }
+        const n = ++my;
+        try {
+          const list = await api(`/admin/hackathons/${hid}/people?q=${encodeURIComponent(q)}`);
+          if (n !== my) return;
+          box.innerHTML = list.length ? list.map((u) => `<button class="capsule press" onclick='admPick(${u.tg_id}, ${tid ?? "null"}, ${u.team_id ?? "null"}, ${esc(JSON.stringify(u.name))})'>
+              <span class="avatar sm plain">${esc(initial(u.name))}</span>
+              <span class="grow stack" style="gap:0"><span class="h3 ellipsis" style="font-size:14px">${esc(u.name)}</span>
+                <span class="small muted ellipsis">${esc(u.user?.fio || "ФИО не указано")}${u.username ? " · @" + esc(u.username) : ""}</span></span>
+              ${u.team_name ? `<span class="chip ellipsis" style="max-width:38%">«${esc(u.team_name)}»</span>` : u.registered ? `<span class="chip accent">без команды</span>` : `<span class="chip">не записан</span>`}</button>`).join("")
+            : `<div class="hint-empty">${ic("users", 28, 1.6)}<span>Никого не нашли</span></div>`;
+        } catch (e) { if (n === my) box.innerHTML = `<p class="small c-bad" style="text-align:center">${esc(e.message)}</p>`; }
+      };
+      inp.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(run, 250); });
+      run();
+      setTimeout(() => inp.focus(), 250);
+    },
+  });
+}
+async function admPick(uid, tid, curTid, name) {
+  if (tid) {
+    if (curTid === tid) { toast(`${name} уже в этой команде`, "err"); return; }
+    if (curTid && !confirm(`${name} сейчас в другой команде. Перевести?`)) return;
+    try { await teamCall(`/admin/hackathons/${ADM_TEAMS.hid}/teams/move`, json("POST", { user_id: uid, team_id: tid }), `${name} добавлен(а) в команду`); goBack(); } catch {}
+    return;
+  }
+  admMoveSheet(uid, curTid, name);
 }
 
 // ---------- профиль ----------
@@ -808,7 +1256,7 @@ function profileRoute() {
           <span class="small muted" style="font-weight:600">Как тебя зовут</span>
           <label class="field"><span>Ник в боте — его видят другие</span>
             <input class="input" name="nickname" maxlength="40" value="${esc(p.nickname || "")}" placeholder="${esc(p.tg_name)}"></label>
-          <label class="field"><span>ФИО — видят только организаторы</span>
+          <label class="field"><span>ФИО — полностью видят только организаторы; по нему капитан может найти тебя и позвать в команду</span>
             <input class="input" name="fio" maxlength="150" value="${esc(p.fio || "")}" placeholder="Иванов Иван Иванович" autocomplete="name"></label>
           ${!p.fio && !me.is_admin ? `<span class="small c-warn" style="padding:0 6px">ФИО нужно, чтобы засчитать домашки.</span>` : ""}
           <button class="btn primary" id="profile-save" type="submit" disabled>Сохранить</button></form>
@@ -1125,11 +1573,12 @@ function manageRoute() {
         const S = { running: ["solid", "Идёт"], upcoming: ["accent", "Запланирован"], finished: ["", "Завершён"] };
         cards = list.length ? [...list].reverse().map((h) => `<div class="card" style="padding:14px 14px 12px 16px">
             <div class="row" style="align-items:flex-start"><span class="grow stack" style="gap:4px"><span class="h3" style="font-size:16px">${esc(h.title)}</span>
-              <span class="small muted">${msk(h.starts_at)} – ${msk(h.ends_at)} · ${esc(h.metric_title)}</span></span>
+              <span class="small muted">${msk(h.starts_at)} – ${msk(h.ends_at)} · ${esc(h.metric_title)}${h.team_mode ? ` · команды до ${h.team_max}` : ""}</span></span>
               <span class="chip ${S[h.status][0]}">${S[h.status][1]}</span></div>
             <div class="row wrap" style="gap:6px">
               <button class="btn xs" style="background:var(--bg)" onclick="show(hackAllSubsRoute(${h.id}))">Решения</button>
               <button class="btn xs" style="background:var(--bg)" onclick="show(hackRoute(${h.id}))">Лидерборд</button>
+              ${h.team_mode ? `<button class="btn xs" style="background:var(--bg)" onclick="show(teamsAdminRoute(${h.id}))">${ic("users", 14, 2)}Команды</button>` : ""}
               <button class="btn xs" style="background:var(--bg)" onclick="show(hackFormRoute(${h.id}))">${ic("edit", 14, 2)}Изменить</button>
               ${h.is_active ? "" : `<span class="chip warn">скрыт</span>`}</div></div>`).join("")
           : emptyState("trophy", "Хакатонов нет", "Создай хакатон — участники получат анонс.");
@@ -1311,6 +1760,22 @@ function hackFormRoute(id) {
             <label class="field"><span>id-колонка</span><input class="input mono" name="id_column" required value="${v("id_column", "id")}"></label>
             <label class="field"><span>ответ</span><input class="input mono" name="target_column" required value="${v("target_column", "target")}"></label>
             <label class="field"><span>в день</span><input class="input mono" name="daily_limit" type="number" min="1" value="${v("daily_limit", 5)}"></label></div>
+          <div class="field"><span>Формат участия</span>
+            <input type="hidden" name="team_mode" value="${h?.team_mode ? "true" : "false"}">
+            <div class="seg sm" id="h-mode">
+              <button type="button" data-mode="false" class="${h?.team_mode ? "" : "on"}">${ic("user", 16, 2)}Каждый сам</button>
+              <button type="button" data-mode="true" class="${h?.team_mode ? "on" : ""}">${ic("users", 16, 2)}Командами</button></div></div>
+          <section class="form-sec team-opts${h?.team_mode ? "" : " hide"}" id="team-opts" style="padding-top:0">
+            <div class="toggle-row" style="cursor:default">
+              <span class="grow stack" style="gap:0"><span class="h3" style="font-size:14px">Максимум в команде</span><span class="small muted">от 2 до 10 человек; в команде может быть и один</span></span>
+              <input type="hidden" name="team_max" value="${h?.team_max || 5}">
+              <span class="stepper"><button type="button" data-step="-1" aria-label="Меньше">−</button><span class="v" id="tm-v">${h?.team_max || 5}</span><button type="button" data-step="1" aria-label="Больше">+</button></span></div>
+            <label class="field"><span>Команды формируются до, МСК · пусто — до старта</span>
+              <input class="input" name="team_deadline" type="datetime-local" value="${h?.team_mode && h.team_deadline !== h.starts_at ? toInput(h.team_deadline) : ""}"${h?.teams_formed ? " disabled" : ""}></label>
+            <div class="team-how">
+              <span class="row">${ic("crown", 16, 2)}<span>Участник создаёт команду и становится капитаном: зовёт людей по нику, @username или ФИО и принимает заявки.</span></span>
+              <span class="row">${ic("dice", 16, 2)}<span>${h?.teams_formed ? "Команды уже сформированы, составы закреплены." : "К этому времени всех без команды случайно распределим по командам ровных размеров, а составы закрепим."}</span></span>
+              <span class="row">${ic("trophy", 16, 2)}<span>Лидерборд — по командам, лимит попыток в день общий на команду.</span></span></div></section>
           ${fileRow("train", "train.csv — с ответами", ".csv,.zip", h?.files.train, !h)}
           ${fileRow("test", "test.csv — без ответов", ".csv", h?.files.test, !h)}
           ${fileRow("solution", "Ответы на test — скрыты, по ним считается метрика", ".csv", h?.files.solution, !h, true)}
@@ -1329,11 +1794,34 @@ function hackFormRoute(id) {
         $("#h-form").setAttribute("data-dirty", "");
         hap("select");
       }));
+      $$("#h-mode button").forEach((b) => b.addEventListener("click", () => {
+        const on = b.dataset.mode === "true";
+        $$("#h-mode button").forEach((x) => x.classList.toggle("on", x === b));
+        $('#h-form [name="team_mode"]').value = on ? "true" : "false";
+        const sec = $("#team-opts");
+        sec.classList.toggle("hide", !on);
+        if (on) { sec.classList.remove("enter"); void sec.offsetWidth; sec.classList.add("enter"); }
+        $("#h-form").setAttribute("data-dirty", "");
+        hap("select");
+      }));
+      $$("#team-opts [data-step]").forEach((b) => b.addEventListener("click", () => {
+        const inp = $('#h-form [name="team_max"]');
+        const v = Math.min(10, Math.max(2, +inp.value + +b.dataset.step));
+        inp.value = v; $("#tm-v").textContent = v;
+        $("#h-form").setAttribute("data-dirty", "");
+        hap("select");
+      }));
       $("#h-form").onsubmit = async (ev) => {
         ev.preventDefault();
         const f = ev.target;
         const fd = new FormData(f);
         for (const k of ["train", "test", "solution", "baseline", "task"]) if (!fd.get(k)?.name) fd.delete(k);
+        const teamOn = fd.get("team_mode") === "true";
+        if (!teamOn) { fd.delete("team_max"); fd.delete("team_deadline"); }
+        else if (!fd.get("team_deadline")) {
+          // при правке пустое поле значит «до старта»: сервер ждёт для этого "null"
+          if (id && !f.elements.team_deadline.disabled) fd.set("team_deadline", "null"); else fd.delete("team_deadline");
+        }
         if (id) fd.set("is_active", $("#h-active .switch").classList.contains("on") ? "true" : "false");
         const btn = $("#h-save"); btn.disabled = true;
         const old = btn.innerHTML; btn.innerHTML = `<span class="spinner"></span>Сохраняем…`;
@@ -1356,7 +1844,7 @@ function hackAllSubsRoute(id) {
       return `${topbar("Все решения", esc(h.title))}
         ${subs.length ? `<div class="list-grid">${[...subs].reverse().map((x) => `<div class="capsule round">
           <span class="avatar sm plain">${esc(initial(x.user.name))}</span>
-          <span class="grow stack" style="gap:1px"><span class="h3 ellipsis" style="font-size:14px">${esc(x.user.name)} <span class="small muted" style="font-weight:400">${esc(x.user.fio || "ФИО —")}</span></span>
+          <span class="grow stack" style="gap:1px"><span class="h3 ellipsis" style="font-size:14px">${x.team_name ? `<span class="c-accent">${esc(x.team_name)}</span> · ` : ""}${esc(x.user.name)} <span class="small muted" style="font-weight:400">${esc(x.user.fio || "ФИО —")}</span></span>
             <span class="small muted mono">№${x.number} · id ${x.id} · ${when(x.created_at)}</span>
             ${x.status !== "done" ? `<span class="small c-bad">${esc(x.error)}</span>` : ""}</span>
           <span class="mono small ${x.status === "done" ? "" : "c-bad"}" style="font-size:13px">${x.status === "done" ? num(x.score) : "ошибка"}</span></div>`).join("")}</div>`
