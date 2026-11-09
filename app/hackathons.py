@@ -9,11 +9,11 @@ from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
 
 from app import metrics
-from app.db import Hackathon, HackathonSubmission, Team, TeamMember, User, utcnow
+from app.db import Hackathon, HackathonSubmission, Team, TeamMember, TeamRequest, User, utcnow
 from app.formatting import as_utc, fmt_dt
 from app.service import HomeworkService, ServiceError
 from app import teams as tm
@@ -245,6 +245,37 @@ class HackathonService:
                     sub.score, sub.status, sub.error = None, "error", str(e)
             await s.commit()
         return len(subs)
+
+    async def deletion_impact(self, hackathon_id: int) -> dict:
+        """Что пропадёт вместе с хакатоном — для окна подтверждения."""
+        h = await self.get(hackathon_id)
+        async with self.sm() as s:
+            subs, authors = (await s.execute(
+                select(func.count(HackathonSubmission.id), func.count(func.distinct(HackathonSubmission.user_id)))
+                .where(HackathonSubmission.hackathon_id == hackathon_id)
+            )).one()
+            teams = await s.scalar(select(func.count(Team.id)).where(Team.hackathon_id == hackathon_id))
+            members = await s.scalar(select(func.count(TeamMember.id)).where(TeamMember.hackathon_id == hackathon_id))
+        return {"id": h.id, "title": h.title, "status": status_of(h), "submissions": subs, "participants": authors,
+                "teams": teams, "members": members, "team_mode": bool(h.team_mode), "is_active": h.is_active}
+
+    async def delete(self, hackathon_id: int) -> dict:
+        """Удалить хакатон насовсем: решения, лидерборд, команды, приглашения и загруженные файлы.
+
+        Обратимый вариант — скрыть хакатон (is_active = False).
+        """
+        impact = await self.deletion_impact(hackathon_id)
+        async with self.sm() as s:
+            h = await s.get(Hackathon, hackathon_id)
+            folder = Path(h.folder) if h.folder else None
+            for model in (TeamRequest, HackathonSubmission, TeamMember, Team):
+                await s.execute(delete(model).where(model.hackathon_id == hackathon_id))
+            await s.delete(h)
+            await s.commit()
+        # Решения участников лежат в папке хакатона (folder/submissions), её и удаляем
+        if folder is not None and folder != self.root and self.hw._inside_files(folder):
+            shutil.rmtree(folder, ignore_errors=True)
+        return impact
 
     # ---------- общее ----------
 

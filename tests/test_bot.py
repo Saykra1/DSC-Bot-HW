@@ -225,3 +225,21 @@ async def test_hackathon_in_bot(env):
     assert "№2" in session.texts()[-1] and "№1" in session.texts()[-1]
     await press(STUDENT, f"hf:{h.id}:solution")
     assert not any(isinstance(r, SendDocument) for r in session.requests[-1:])
+
+
+async def test_help_faq_buttons(env):
+    from aiogram.methods import EditMessageText
+
+    from app.faq import FAQ
+
+    service, session, send, press = env
+    await send(STUDENT, "/help")
+    msg = [r for r in session.requests if isinstance(r, SendMessage)][-1]
+    keys = [b.callback_data for row in msg.reply_markup.inline_keyboard for b in row]
+    assert keys == [f"faq:{k}" for k in FAQ] and all(len(k.encode()) <= 64 for k in keys)
+
+    await press(STUDENT, "faq:vpn")
+    edits = [r for r in session.requests if isinstance(r, EditMessageText)]
+    assert "Франци" in edits[-1].text and edits[-1].reply_markup.inline_keyboard[0][0].callback_data == "faq:"
+    await press(STUDENT, "faq:")
+    assert "Частые вопросы" in [r for r in session.requests if isinstance(r, EditMessageText)][-1].text

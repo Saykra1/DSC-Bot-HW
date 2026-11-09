@@ -57,6 +57,8 @@ const I = {
   crown: "M4 19h16M4 8l4.5 4L12 5l3.5 7L20 8l-1.5 8h-13z",
   logout: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9",
   mail: "M3 5h18v14H3zM3 7l9 6 9-6",
+  trash: "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6",
+  eyeOff: "M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.2M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a10 10 0 0 0 5.4-1.6M9.9 9.9a3 3 0 0 0 4.2 4.2",
 };
 const ic = (name, size = 20, sw = 1.8) =>
   `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${I[name]}"/></svg>`;
@@ -1141,11 +1143,11 @@ async function formTeams(hid, btn, n) {
 }
 
 // нижняя шторка с действиями
-function openSheet(title, body) {
+function openSheet(title, body, cls = "") {
   closeSheet();
   const bg = document.createElement("div");
   bg.className = "sheet-bg";
-  bg.innerHTML = `<div class="sheet" role="dialog" aria-label="${esc(title)}"><div class="row between" style="padding:0 4px 4px"><span class="h3">${title}</span>
+  bg.innerHTML = `<div class="sheet ${cls}" role="dialog" aria-label="${esc(title)}"><div class="row between" style="padding:0 4px 4px"><span class="h3">${title}</span>
     <button class="icon-btn sm" aria-label="Закрыть" onclick="closeSheet()">${ic("close", 16, 2)}</button></div>${body}</div>`;
   bg.addEventListener("click", (e) => { if (e.target === bg) closeSheet(); });
   document.body.appendChild(bg);
@@ -1570,6 +1572,7 @@ function manageRoute() {
               <button class="btn xs" style="background:var(--bg)" onclick="ADMIN_AID=${a.id};SELECTED_SID=null;openTab('subs')">Сдачи</button>
               <button class="btn xs" style="background:var(--bg)" onclick="download('/admin/assignments/${a.id}/export.csv','results_${a.id}.csv')">CSV</button>
               <button class="btn xs" style="background:var(--bg)" onclick="show(assignmentFormRoute(${a.id}))">${ic("edit", 14, 2)}Изменить</button>
+              <button class="icon-btn xs danger" aria-label="Удалить задание" title="Удалить" onclick="askDelete('a', ${a.id})">${ic("trash", 15, 2)}</button>
               <span class="grow"></span>
               <button class="row small muted" style="background:none;border:0;gap:8px;padding:0" onclick="toggleActive(${a.id}, ${!a.is_active}, this)" aria-label="Приём работ">
                 приём<span class="switch${a.is_active ? " on" : ""}"></span></button></div></div>`;
@@ -1587,6 +1590,7 @@ function manageRoute() {
               <button class="btn xs" style="background:var(--bg)" onclick="show(hackRoute(${h.id}))">Лидерборд</button>
               ${h.team_mode ? `<button class="btn xs" style="background:var(--bg)" onclick="show(teamsAdminRoute(${h.id}))">${ic("users", 14, 2)}Команды</button>` : ""}
               <button class="btn xs" style="background:var(--bg)" onclick="show(hackFormRoute(${h.id}))">${ic("edit", 14, 2)}Изменить</button>
+              <button class="icon-btn xs danger" aria-label="Удалить хакатон" title="Удалить" onclick="askDelete('h', ${h.id})">${ic("trash", 15, 2)}</button>
               ${h.is_active ? "" : `<span class="chip warn">скрыт</span>`}</div></div>`).join("")
           : emptyState("trophy", "Хакатонов нет", "Создай хакатон — участники получат анонс.");
       }
@@ -1600,6 +1604,107 @@ async function toggleActive(id, active, btn) {
   hap("select");
   try { await api(`/admin/assignments/${id}`, json("PATCH", { is_active: active })); toast(active ? "Приём работ открыт" : "Приём работ закрыт"); reload(); }
   catch (e) { sw.classList.toggle("on", !active); toast(e.message, "err"); }
+}
+
+// ---------- удаление задания / хакатона ----------
+// Удаляем насовсем (вместе со сдачами), поэтому окно показывает последствия и предлагает обратимый вариант —
+// закрыть приём / скрыть. Если удалять есть что, кнопку нужно удерживать: случайный тап ничего не сотрёт.
+const DEL_HOLD_MS = 1200;
+function dangerZone(kind, id) {
+  const isA = kind === "a";
+  return `<section class="danger-zone">
+    <span class="dz-ic">${ic("trash", 18, 2)}</span>
+    <span class="grow stack" style="gap:2px"><span class="h3" style="font-size:14px">${isA ? "Удалить задание" : "Удалить хакатон"}</span>
+      <span class="small muted">${isA ? "вместе со всеми сдачами, оценками и комментариями" : "вместе с решениями, лидербордом и командами"}</span></span>
+    <button type="button" class="btn xs dz-btn" onclick="askDelete('${kind}', ${id})">Удалить…</button></section>`;
+}
+function delTile(n, one, few, many) {
+  return `<div class="tile${n ? "" : " zero"}"><span class="v">${n}</span><span class="k">${plural(n, one, few, many)}</span></div>`;
+}
+async function askDelete(kind, id) {
+  const isA = kind === "a";
+  hap("warning");
+  let d;
+  try { d = await api(`/admin/${isA ? "assignments" : "hackathons"}/${id}/delete`); }
+  catch (e) { toast(e.message, "err"); return; }
+  const loses = d.submissions > 0 || (!isA && d.members > 0);
+  const tiles = isA
+    ? delTile(d.submissions, "сдача", "сдачи", "сдач") + delTile(d.participants, "участник", "участника", "участников") + delTile(d.comments, "комментарий", "комментария", "комментариев")
+    : delTile(d.submissions, "решение", "решения", "решений") + (d.team_mode
+      ? delTile(d.teams, "команда", "команды", "команд") + delTile(d.members, "участник", "участника", "участников")
+      : delTile(d.participants, "участник", "участника", "участников"));
+  const notes = [];
+  if (isA && d.checking) notes.push(`${d.checking} ${plural(d.checking, "работа сейчас проверяется", "работы сейчас проверяются", "работ сейчас проверяются")} — проверка прервётся, отзыв не придёт.`);
+  if (!isA && d.status === "running") notes.push("Хакатон идёт прямо сейчас — у участников пропадут лидерборд и попытки.");
+  const alt = d.is_active ? `<div class="del-alt">
+      <span class="row" style="align-items:flex-start;gap:10px">${ic(isA ? "lock" : "eyeOff", 18, 2)}
+        <span class="grow small">${isA ? "Можно не удалять: <b>закрой приём</b> — задание пропадёт у участников, а сдачи и оценки останутся." : "Можно не удалять: <b>скрой хакатон</b> — он пропадёт у участников, а решения и команды останутся."}</span></span>
+      <button class="btn xs" onclick="softHide('${kind}', ${id}, this)">${isA ? "Закрыть приём" : "Скрыть"}</button></div>` : "";
+  openSheet("", `<div class="del-hero">
+      <span class="del-ic">${ic("trash", 26, 2)}</span>
+      <span class="h2">${isA ? "Удалить задание?" : "Удалить хакатон?"}</span>
+      <span class="muted del-title">«${esc(d.title)}»</span></div>
+    ${loses ? `<span class="small muted" style="padding:0 6px">Удалится навсегда:</span><div class="del-tiles">${tiles}</div>`
+      : `<span class="small muted del-empty">${isA ? "Сдач по заданию ещё нет" : "Решений и участников ещё нет"} — удалятся только условие и файлы.</span>`}
+    ${notes.map((n) => `<div class="del-note">${ic("warn", 16, 2)}<span>${n}</span></div>`).join("")}
+    ${alt}
+    <button class="btn block del-go${loses ? " hold" : ""}" id="del-go" data-kind="${kind}" data-id="${id}">
+      <span class="lbl">${ic("trash", 18, 2)}${loses ? "Удерживай, чтобы удалить" : "Удалить"}</span>
+      ${loses ? `<span class="fill" aria-hidden="true"><span class="lbl">${ic("trash", 18, 2)}Удерживай, чтобы удалить</span></span>` : ""}</button>
+    <button class="btn block ghost" onclick="closeSheet()">Отмена</button>`, "del-sheet");
+  bindDelete($("#del-go"), loses);
+}
+function bindDelete(btn, hold) {
+  if (!hold) { btn.onclick = () => doDelete(btn); return; }
+  let t = null;
+  const start = (e) => {
+    if (btn.disabled || t) return;
+    e.preventDefault();
+    btn.classList.add("arming");
+    hap("light");
+    t = setTimeout(() => { t = null; btn.classList.remove("arming"); doDelete(btn); }, DEL_HOLD_MS);
+  };
+  const stop = () => {
+    if (!t) return;
+    clearTimeout(t); t = null;
+    btn.classList.remove("arming");
+    $$(".lbl", btn).forEach((x) => { x.innerHTML = `${ic("trash", 18, 2)}Держи чуть дольше`; });
+  };
+  btn.addEventListener("pointerdown", start);
+  ["pointerup", "pointerleave", "pointercancel"].forEach((ev) => btn.addEventListener(ev, stop));
+  btn.addEventListener("contextmenu", (e) => e.preventDefault());
+  // с клавиатуры: Enter/пробел тоже нужно удерживать
+  btn.addEventListener("keydown", (e) => { if ((e.key === "Enter" || e.key === " ") && !e.repeat) start(e); });
+  btn.addEventListener("keyup", (e) => { if (e.key === "Enter" || e.key === " ") stop(); });
+}
+async function doDelete(btn) {
+  const isA = btn.dataset.kind === "a", id = +btn.dataset.id;
+  btn.disabled = true;
+  btn.querySelector(".lbl").innerHTML = `<span class="spinner"></span>Удаляем…`;
+  try {
+    await api(`/admin/${isA ? "assignments" : "hackathons"}/${id}`, { method: "DELETE" });
+    closeSheet();
+    toast(isA ? "Задание удалено" : "Хакатон удалён");
+    if (isA && ADMIN_AID === id) ADMIN_AID = null;
+    // если удаляли из формы или с экрана хакатона — возвращаемся к списку
+    while (stack.length > 1) stack.pop();
+    if (CUR_TAB !== "manage") { MANAGE_KIND = isA ? "a" : "h"; openTab("manage"); } else show(stack[0], { push: false, anim: null });
+  } catch (e) {
+    toast(e.message, "err");
+    btn.disabled = false;
+    btn.querySelector(".lbl").innerHTML = `${ic("trash", 18, 2)}Повторить`;
+  }
+}
+async function softHide(kind, id, btn) {
+  btn.disabled = true;
+  try {
+    if (kind === "a") await api(`/admin/assignments/${id}`, json("PATCH", { is_active: false }));
+    else { const fd = new FormData(); fd.set("is_active", "false"); await api(`/admin/hackathons/${id}/edit`, { method: "POST", body: fd }); }
+    closeSheet();
+    toast(kind === "a" ? "Приём закрыт, сдачи сохранены" : "Хакатон скрыт, решения сохранены");
+    while (stack.length > 1) stack.pop();
+    show(stack[0], { push: false, anim: null });
+  } catch (e) { toast(e.message, "err"); btn.disabled = false; }
 }
 
 function fileRow(name, label, accept, current, required, hidden = false) {
@@ -1654,6 +1759,7 @@ function assignmentFormRoute(id) {
             ${fileRow("template", hasNb && a ? "Новый шаблон — только если нужно заменить" : "Шаблон для участников (.ipynb)", ".ipynb", "", false)}
             ${fileRow("reference", hasNb && a ? "Новый эталон — только если нужно заменить" : "Эталонное решение (.ipynb)", ".ipynb", "", false)}</section>
           <div id="a-result"></div>
+          ${a ? dangerZone("a", a.id) : ""}
           <div class="cta"><button class="btn primary" type="submit" id="a-save" data-label="${label}">${later_ ? "Сохранить и запланировать" : label}</button></div></form>`;
     },
     after() {
@@ -1791,6 +1897,7 @@ function hackFormRoute(id) {
             <span class="grow stack" style="gap:0"><span class="h3" style="font-size:14px">Виден участникам</span><span class="small muted">выключи, чтобы спрятать хакатон</span></span>
             <span class="switch${h.is_active ? " on" : ""}"></span></button>` : ""}
           <span class="small muted" style="padding:0 6px">Время — по Москве. ${h ? "Если заменить ответы, метрику или колонки, все решения пересчитаются." : "Участники получат анонс сразу, а в момент старта — сообщение, что хакатон начался."}</span>
+          ${h ? dangerZone("h", h.id) : ""}
           <div class="cta"><button class="btn primary" type="submit" id="h-save">${h ? "Сохранить" : "Создать хакатон"}</button></div></form>`;
     },
     after() {
