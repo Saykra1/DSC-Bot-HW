@@ -1,0 +1,44 @@
+# Продакшен-запуск на сервере: бот + веб мини аппа + Caddy (HTTPS с автоматическим сертификатом).
+# Подробности: docs/DEPLOY.md
+services:
+  bot:
+    build: .
+    image: dsc-bot:latest
+    env_file: .env
+    environment:
+      # Внутри контейнера всегда так, независимо от .env
+      DATA_DIR: /app/data
+      HOST: 0.0.0.0
+      PORT: "8080"
+    volumes:
+      - ./data:/app/data
+    # Наружу порт не открываем: снаружи бот доступен только через Caddy по HTTPS
+    expose:
+      - "8080"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  caddy:
+    image: caddy:2
+    depends_on:
+      - bot
+    environment:
+      DOMAIN: ${DOMAIN:?Укажи DOMAIN в .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  caddy_data:
+  caddy_config:

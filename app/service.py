@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -201,16 +202,25 @@ class HomeworkService:
     # ---------- пользователи ----------
 
     async def upsert_user(self, tg_id: int, username: str | None, full_name: str) -> User:
-        async with self.sm() as s:
-            user = await s.get(User, tg_id)
-            if user is None:
-                user = User(tg_id=tg_id, username=username, full_name=full_name or "")
-                s.add(user)
-            else:
-                user.username = username
-                user.full_name = full_name or user.full_name
-            await s.commit()
-            return user
+        # Первое сообщение боту и открытие мини аппа могут прийти одновременно: оба запроса не находят
+        # пользователя и пытаются его создать. Проигравший получает IntegrityError и просто обновляет запись.
+        for attempt in range(2):
+            async with self.sm() as s:
+                user = await s.get(User, tg_id)
+                if user is None:
+                    user = User(tg_id=tg_id, username=username, full_name=full_name or "")
+                    s.add(user)
+                else:
+                    user.username = username
+                    user.full_name = full_name or user.full_name
+                try:
+                    await s.commit()
+                except IntegrityError:
+                    if attempt:
+                        raise
+                    continue
+                return user
+        raise AssertionError("unreachable")
 
     def is_admin(self, tg_id: int) -> bool:
         return self.settings.is_admin(tg_id)

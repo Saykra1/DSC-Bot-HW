@@ -1,0 +1,9 @@
+# Caddy сам получает и продлевает сертификат Let's Encrypt для {$DOMAIN}.
+{$DOMAIN} {
+	encode zstd gzip
+	# Загрузка ноутбуков и файлов хакатонов (лимит в приложении — MAX_UPLOAD_MB, по умолчанию 10)
+	request_body {
+		max_size 100MB
+	}
+	reverse_proxy bot:8080
+}
