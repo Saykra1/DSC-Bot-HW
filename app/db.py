@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
+    event,
     BigInteger,
     Boolean,
     DateTime,
@@ -194,8 +195,27 @@ class HackathonSubmission(Base):
     user: Mapped[User] = relationship()
 
 
+# Сколько миллисекунд запрос ждёт, если база занята другой записью, прежде чем упасть с «database is locked»
+SQLITE_BUSY_TIMEOUT_MS = 15000
+
+
 def make_engine(url: str) -> AsyncEngine:
-    return create_async_engine(url, future=True)
+    if not url.startswith("sqlite"):
+        return create_async_engine(url, future=True)
+    engine = create_async_engine(url, future=True, connect_args={"timeout": SQLITE_BUSY_TIMEOUT_MS / 1000})
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):
+        # WAL: чтения не ждут записи и наоборот (важно, когда много участников разом и идёт бэкап).
+        # synchronous=NORMAL в WAL безопасен для целостности и заметно быстрее на записи.
+        cur = dbapi_conn.cursor()
+        if ":memory:" not in url:
+            cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        cur.close()
+
+    return engine
 
 
 def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker:
