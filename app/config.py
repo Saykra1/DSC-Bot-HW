@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     llm_max_retries: int = 4
     # Сколько проверок идёт параллельно (у бесплатных моделей жёсткие лимиты)
     check_concurrency: int = 1
+    # Не больше стольких запросов к LLM в минуту (на весь бот). 0 — авто: 18 для моделей :free
+    # (у OpenRouter лимит 20 в минуту на аккаунт), иначе без ограничения. -1 — выключить.
+    llm_rpm: int = 0
+    # Сколько секунд одна проверка может пережидать лимит запросов (429), прежде чем сдаться
+    llm_rate_wait: float = 900.0
 
     # Хранилище
     data_dir: Path = Path("data")
@@ -103,6 +108,12 @@ class Settings(BaseSettings):
     def llm_enabled(self) -> bool:
         local = "localhost" in self.llm_base_url or "127.0.0.1" in self.llm_base_url
         return bool(self.llm_model) and (bool(self.llm_api_key) or local)
+
+    @property
+    def llm_rpm_limit(self) -> int:
+        if self.llm_rpm:
+            return max(self.llm_rpm, 0)
+        return 18 if any(m.strip().endswith(":free") for m in self.llm_model.split(",")) else 0
 
     def is_admin(self, tg_id: int) -> bool:
         return tg_id in self.admin_ids

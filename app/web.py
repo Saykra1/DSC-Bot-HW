@@ -105,6 +105,7 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
     settings = service.settings
     hacks = hackathons_for(service)
     api = APIRouter(prefix="/api")
+    known_users: dict[int, tuple[str | None, str]] = {}  # tg_id -> (username, имя), уже записанные в базу
 
     def parse_dt(value: str | None, what: str) -> datetime | None:
         """Время из формы: ISO или datetime-local. Без часового пояса считаем, что это МСК (TIMEZONE)."""
@@ -139,7 +140,10 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
                 raise HTTPException(401, "Нет пользователя")
             u = data.user
             full_name = " ".join(x for x in [u.first_name, u.last_name] if x)
-            await service.upsert_user(u.id, u.username, full_name)
+            # Мини апп шлёт 3–5 запросов на каждый экран: пишем в базу, только если имя в Telegram поменялось
+            if known_users.get(u.id) != (u.username, full_name):
+                await service.upsert_user(u.id, u.username, full_name)
+                known_users[u.id] = (u.username, full_name)
             return CurrentUser(u.id, service.is_admin(u.id))
         if settings.dev_user_id:
             await service.upsert_user(settings.dev_user_id, "dev", "Dev User")
@@ -231,7 +235,7 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
             sub = await service.submit(user.id, aid, raw, file.filename or "")
         except ServiceError as e:
             raise err(e)
-        return submission_to_dict(sub)
+        return submission_to_dict(sub) | {"queue": await service.queue_info(sub.id)}
 
     @api.get("/assignments/{aid}/quiz")
     async def quiz(aid: int, user: UserDep):
@@ -268,6 +272,8 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
             "assignment_title": sub.assignment.title,
             "reference_available": reference_available(sub.assignment),
         }
+        if sub.status == "queued":
+            d["queue"] = await service.queue_info(sid)
         if not user.is_admin:
             d["error"] = None
             d = participant_view(d, sub)

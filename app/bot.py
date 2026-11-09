@@ -34,6 +34,14 @@ from app.service import HomeworkService, ServiceError, has_notebook, is_publishe
 
 log = logging.getLogger(__name__)
 
+def queue_text(q: dict | None) -> str:
+    """«Перед тобой 12 работ, примерно 8 мин» — только когда очередь заметная."""
+    if not q or q["ahead"] < 3:
+        return ""
+    eta = f", примерно {max(1, round(q['eta_seconds'] / 60))} мин" if q.get("eta_seconds") else ""
+    return f"\nПеред тобой в очереди {q['ahead']} работ{eta}."
+
+
 STATUS_TEXT = {"queued": "⏳ в очереди", "checking": "🔎 проверяется", "done": "готово", "error": "⚠️ ошибка"}
 
 
@@ -289,7 +297,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             await message.answer(f"❌ {escape(str(e))}")
             return
         attempt = await service.attempt_number(sub)
-        await message.answer(f"Принято! Попытка {attempt} в очереди на проверку, отзыв придёт сюда.")
+        await message.answer(f"Принято! Попытка {attempt} в очереди на проверку, отзыв придёт сюда.{queue_text(await service.queue_info(sub.id))}")
 
     @router.message(SubmitFlow.waiting_file, F.document)
     async def got_file(message: Message, state: FSMContext, bot: Bot):

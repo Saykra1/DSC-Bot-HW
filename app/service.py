@@ -6,7 +6,9 @@ import asyncio
 import csv
 import io
 import logging
+import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
@@ -192,6 +194,7 @@ class HomeworkService:
         self._workers: list[asyncio.Task] = []
         self._prepared: dict[int, PreparedAssignment] = {}
         self._rechecks: set[int] = set()  # перепроверки по запросу организатора
+        self._check_seconds: deque[float] = deque(maxlen=20)  # длительность последних проверок — для оценки очереди
         # Периодические задачи: публикация отложенных заданий, анонсы хакатонов
         self.periodic_hooks: list[Callable[[], Awaitable[None]]] = [self.announce_due]
         self.scheduler_interval = 30
@@ -593,6 +596,26 @@ class HomeworkService:
             await s.commit()
         await self._queue.put(sub.id)
         return sub
+
+    async def queue_info(self, submission_id: int) -> dict | None:
+        """Сколько работ в очереди перед этой и примерно сколько ждать (для участника, пока работа в очереди)."""
+        async with self.sm() as s:
+            status = await s.scalar(select(Submission.status).where(Submission.id == submission_id))
+            if status != "queued":
+                return None
+            ahead = await s.scalar(
+                select(func.count(Submission.id)).where(Submission.status == "queued", Submission.id < submission_id)
+            ) or 0
+        return {"ahead": ahead, "eta_seconds": self.queue_eta(ahead)}
+
+    def queue_eta(self, ahead: int) -> int | None:
+        """Оценка ожидания: средняя длительность проверки с учётом параллельности и лимита запросов к LLM."""
+        if not self._check_seconds:
+            return None
+        per_slot = (sum(self._check_seconds) / len(self._check_seconds)) / max(1, self.settings.check_concurrency)
+        rpm = getattr(getattr(self.llm, "limiter", None), "rpm", 0) or 0
+        per_item = max(per_slot, 60 / rpm if rpm else 0)
+        return int((ahead + 1) * per_item)
 
     def _check_open(self, a: Assignment | None, user_id: int) -> None:
         if a is None:
@@ -1019,6 +1042,7 @@ class HomeworkService:
             sub.status = "checking"
             await s.commit()
 
+        t0 = time.monotonic()
         try:
             prepared = await self._get_prepared(a)
             result: CheckResult = await check_submission(
@@ -1053,6 +1077,7 @@ class HomeworkService:
             sub.result = result.to_dict()
             sub.checked_at = utcnow()
             await s.commit()
+        self._check_seconds.append(time.monotonic() - t0)
         self._rechecks.discard(submission_id)
         attempt = await self.attempt_number(sub)
         await self._notify(sub.user_id, feedback_messages(a.title, attempt, result, sub.organizer_comment))

@@ -495,12 +495,18 @@ function subRow(s, withTitle = false) {
     <span class="score c-${st === "neutral" ? "accent" : st}">${score}</span><span class="chev">${ic("chev", 16)}</span></a>`;
 }
 
+function queueText(q) {
+  if (!q || q.ahead < 1) return "обычно 1–3 минуты";
+  const eta = q.eta_seconds ? `, примерно ${Math.max(1, Math.round(q.eta_seconds / 60))} мин` : "";
+  return `перед тобой в очереди ${q.ahead}${eta}`;
+}
+
 function progressCard(s) {
   const now = s.status === "queued" ? 0 : 1;
   const step = (i, label) => `<span class="s ${i < now ? "done" : i === now ? "now" : ""}"><i>${i < now ? "✓" : i + 1}</i>${label}</span>`;
   return `<div class="card">
     <div class="steps">${step(0, "В очереди")}<span class="line"></span>${step(1, "Проверяется")}<span class="line"></span>${step(2, "Готово")}</div>
-    <span class="small muted">Попытка №${s.attempt ?? "—"} · обычно 1–3 минуты. Отзыв придёт и в чат с ботом.</span></div>`;
+    <span class="small muted">Попытка №${s.attempt ?? "—"} · ${queueText(s.queue)}. Отзыв придёт и в чат с ботом.</span></div>`;
 }
 
 async function submitWork(id, btn) {
@@ -530,7 +536,8 @@ function resultRoute(id) {
       const sub = `${esc(s.assignment_title)} · ${s.attempt ? `попытка №${s.attempt}` : "не засчитана"}`;
       let html = topbar("Результат проверки", sub);
       if (s.status === "queued" || s.status === "checking") {
-        later(() => revalidate(route, seq, ""), 4000);
+        // Далеко в очереди — спрашиваем реже, чтобы сотня ждущих не нагружала сервер зря
+        later(() => revalidate(route, seq, ""), (s.queue?.ahead ?? 0) > 10 ? 15000 : 4000);
         return html + `<div class="state" style="min-height:30vh"><span class="ill"><span class="spinner" style="width:36px;height:36px;border-width:3px"></span></span>
           <span class="h2">Проверяем работу</span><p>Агент сравнивает решение с эталоном. Можно закрыть приложение — отзыв придёт в чат.</p></div>${progressCard(s)}`;
       }
