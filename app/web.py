@@ -453,6 +453,20 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
             raise HTTPException(404, str(e))
         return {"id": a.id, "is_active": a.is_active}
 
+    @api.get("/admin/assignments/{aid}/delete")
+    async def assignment_delete_info(aid: int, user: AdminDep):
+        try:
+            return await service.deletion_impact(aid)
+        except ServiceError as e:
+            raise HTTPException(404, str(e))
+
+    @api.delete("/admin/assignments/{aid}")
+    async def delete_assignment(aid: int, user: AdminDep):
+        try:
+            return await service.delete_assignment(aid)
+        except ServiceError as e:
+            raise HTTPException(404, str(e))
+
     @api.post("/admin/assignments/{aid}/edit")
     async def edit_assignment(
         aid: int,
@@ -626,6 +640,20 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
         except ServiceError as e:
             raise err(e)
         return await hacks.to_dict(h, user.id) | {"rescored": rescored}
+
+    @api.get("/admin/hackathons/{hid}/delete")
+    async def hackathon_delete_info(hid: int, user: AdminDep):
+        try:
+            return await hacks.deletion_impact(hid)
+        except ServiceError as e:
+            raise HTTPException(404, str(e))
+
+    @api.delete("/admin/hackathons/{hid}")
+    async def delete_hackathon(hid: int, user: AdminDep):
+        try:
+            return await hacks.delete(hid)
+        except ServiceError as e:
+            raise HTTPException(404, str(e))
 
     @api.get("/admin/hackathons/{hid}/submissions")
     async def hackathon_all_submissions(hid: int, user: AdminDep):

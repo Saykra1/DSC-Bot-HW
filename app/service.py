@@ -6,6 +6,7 @@ import asyncio
 import csv
 import io
 import logging
+import shutil
 import time
 import uuid
 from collections import deque
@@ -153,7 +154,8 @@ class DbGradeCache:
                     GradeCacheEntry.code_hash == key,
                 )
             )
-            if exists is None:
+            # Задание могли удалить, пока шла проверка, — тогда кешировать нечего
+            if exists is None and await s.get(Assignment, self.assignment_id) is not None:
                 s.add(GradeCacheEntry(assignment_id=self.assignment_id, task_number=task_number, code_hash=key, data=data))
                 await s.commit()
 
@@ -479,6 +481,61 @@ class HomeworkService:
             a.is_active = active
             await s.commit()
             return a
+
+    async def deletion_impact(self, assignment_id: int) -> dict:
+        """Что пропадёт вместе с заданием — показываем организатору в окне подтверждения."""
+        async with self.sm() as s:
+            a = await s.get(Assignment, assignment_id)
+            if a is None:
+                raise ServiceError("Задание не найдено")
+            row = (await s.execute(
+                select(func.count(Submission.id), func.count(func.distinct(Submission.user_id)),
+                       func.count(Submission.organizer_comment))
+                .where(Submission.assignment_id == assignment_id)
+            )).one()
+            checking = await s.scalar(select(func.count(Submission.id)).where(
+                Submission.assignment_id == assignment_id, Submission.status.in_(["queued", "checking"])
+            ))
+        return {"id": a.id, "title": a.title, "submissions": row[0], "participants": row[1],
+                "comments": row[2], "checking": checking, "is_active": a.is_active}
+
+    async def delete_assignment(self, assignment_id: int) -> dict:
+        """Удалить задание насовсем: сдачи, оценки, комментарии, кеш оценок и файлы.
+
+        Обратимый вариант — закрыть приём (is_active = False): задание пропадёт у участников, сдачи останутся.
+        """
+        impact = await self.deletion_impact(assignment_id)
+        async with self.sm() as s:
+            a = await s.get(Assignment, assignment_id)
+            files = list((await s.scalars(
+                select(Submission.file_path).where(Submission.assignment_id == assignment_id)
+            )).all())
+            folder = Path(a.template_path).parent if a.template_path else None
+            await s.execute(delete(GradeCacheEntry).where(GradeCacheEntry.assignment_id == assignment_id))
+            await s.execute(delete(Submission).where(Submission.assignment_id == assignment_id))
+            await s.delete(a)
+            await s.commit()
+        self._prepared.pop(assignment_id, None)
+        # Файлы чистим после коммита: если база не дала удалить, работы участников не пропадут.
+        for f in files:
+            self._unlink(f)
+        if folder is not None and self._inside_files(folder) and folder != self.files_dir:
+            shutil.rmtree(folder, ignore_errors=True)
+        log.info("Удалено задание #%s «%s» (сдач: %s)", assignment_id, impact["title"], impact["submissions"])
+        return impact
+
+    def _inside_files(self, path: Path) -> bool:
+        try:
+            return path.resolve().is_relative_to(self.files_dir.resolve())
+        except OSError:
+            return False
+
+    def _unlink(self, path: str | None) -> None:
+        if not path:
+            return
+        p = Path(path)
+        if self._inside_files(p):
+            p.unlink(missing_ok=True)
 
     async def get_assignment(self, assignment_id: int) -> Assignment:
         async with self.sm() as s:
@@ -1037,8 +1094,10 @@ class HomeworkService:
         async with self.sm() as s:
             sub = await s.get(Submission, submission_id)
             if sub is None or sub.status == "done":
-                return
+                return  # None — задание удалили, пока сдача ждала в очереди
             a = await s.get(Assignment, sub.assignment_id)
+            if a is None:
+                return
             sub.status = "checking"
             await s.commit()
 
@@ -1052,6 +1111,9 @@ class HomeworkService:
             log.exception("Проверка сдачи %s не удалась", submission_id)
             async with self.sm() as s:
                 sub = await s.get(Submission, submission_id)
+                if sub is None:  # задание удалили во время проверки
+                    self._rechecks.discard(submission_id)
+                    return
                 sub.status = "error"
                 sub.error = str(e)[:2000]
                 await s.commit()
@@ -1070,6 +1132,9 @@ class HomeworkService:
 
         async with self.sm() as s:
             sub = await s.get(Submission, submission_id)
+            if sub is None:  # задание удалили во время проверки — отзыв слать некуда
+                self._rechecks.discard(submission_id)
+                return
             sub.status = "done"
             sub.score = result.score
             sub.auto_score = result.score

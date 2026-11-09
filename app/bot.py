@@ -28,6 +28,7 @@ from aiogram.types import (
 )
 
 from app.checker import CheckResult
+from app.faq import FAQ, HELP_INTRO
 from app.formatting import feedback_messages, fmt_dt, quiz_messages
 from app.hackathons import hackathons_for
 from app.service import HomeworkService, ServiceError, has_notebook, is_published, quiz_attempts, reference_available
@@ -85,7 +86,7 @@ async def setup_bot_ui(bot: Bot, webapp_url: str) -> None:
             BotCommand(command="my", description="Мои сдачи и отзывы"),
             BotCommand(command="hackathon", description="Хакатон: условие, данные, лидерборд"),
             BotCommand(command="profile", description="Профиль: ник и ФИО"),
-            BotCommand(command="help", description="Как сдавать домашки"),
+            BotCommand(command="help", description="Помощь и частые вопросы"),
         ]
     )
     if webapp_url:
@@ -125,7 +126,7 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             "2. Допиши код в ячейках с заданиями.\n"
             "3. Нажми «Сдать работу» и пришли .ipynb файлом.\n"
             "4. Через пару минут придёт оценка и отзыв по коду.\n\n"
-            "/my — твои сдачи и отзывы.\n/hackathon — хакатоны.\n/profile — ник и ФИО."
+            "/my — твои сдачи и отзывы.\n/hackathon — хакатоны.\n/profile — ник и ФИО.\n/help — частые вопросы: VPN, профиль, попытки."
         )
         user = await service.get_user(message.from_user.id)
         if not user.fio and not service.is_admin(message.from_user.id):
@@ -177,17 +178,27 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             return
         await message.answer(f"Готово, ФИО: {escape(u.fio)}")
 
+    def faq_kb() -> InlineKeyboardMarkup:
+        items = list(FAQ.items())
+        rows = [[InlineKeyboardButton(text=label, callback_data=f"faq:{key}")] for key, (label, _) in items]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     @router.message(Command("help"))
     async def help_cmd(message: Message):
-        await message.answer(
-            "Как сдавать: /tasks → задание → «Сдать работу» → отправь .ipynb файлом.\n"
-            "Если в задании есть тест, он проходится в мини аппе (кнопка «Домашки»).\n"
-            "Можно просто прислать .ipynb, я спрошу, к какому заданию его отнести.\n"
-            "Число попыток ограничено, засчитывается лучшая.\n"
-            "После дедлайна в карточке задания появится эталонное решение.\n\n"
-            "Хакатон: /hackathon — условие и данные. Решение — .csv файлом прямо в чат.\n"
-            "/cancel — отменить текущее действие."
-        )
+        await touch(message.from_user)
+        await message.answer(HELP_INTRO, reply_markup=faq_kb())
+
+    @router.callback_query(F.data.startswith("faq:"))
+    async def faq_answer(cb: CallbackQuery):
+        key = cb.data.split(":", 1)[1]
+        back = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← Все вопросы", callback_data="faq:")]])
+        if key in FAQ:
+            text, markup = FAQ[key][1], back
+        else:  # «← Все вопросы» или устаревшая кнопка
+            text, markup = HELP_INTRO, faq_kb()
+        with contextlib.suppress(Exception):  # «message is not modified» при повторном нажатии
+            await cb.message.edit_text(text, reply_markup=markup)
+        await cb.answer()
 
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext):
