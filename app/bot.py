@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from datetime import datetime
 from html import escape
@@ -55,9 +56,16 @@ def build_bot(token: str, proxy: str = "") -> Bot:
 
 
 def make_notifier(bot: Bot):
-    async def notify(tg_id: int, messages: list[str]) -> None:
-        for text in messages:
-            await bot.send_message(tg_id, text)
+    async def notify(tg_id: int, messages: list) -> None:
+        for msg in messages:
+            if isinstance(msg, dict):  # {"text": ..., "buttons": [[[подпись, callback_data], ...], ...]}
+                markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=label, callback_data=data) for label, data in row]
+                    for row in msg.get("buttons") or []
+                ]) if msg.get("buttons") else None
+                await bot.send_message(tg_id, msg["text"], reply_markup=markup)
+            else:
+                await bot.send_message(tg_id, msg)
 
     return notify
 
@@ -530,8 +538,16 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
                           f"<code>{escape(h['target_column'])}</code>, строка на каждый id из test. "
                           "Пришли файл .csv прямо в этот чат.",
                       f"Сегодня использовано {h['used_today']} из {h['daily_limit']} попыток."]
+        if h.get("team_mode"):
+            team = h.get("team")
+            if team:
+                lines.append(f"👥 Твоя команда: <b>{escape(team['name'])}</b> ({team['size']} из {h['team_max']})"
+                             + (" — ты капитан" if team["is_captain"] else ""))
+            elif h["status"] != "finished":
+                lines.append(f"👥 Хакатон командный (до {h['team_max']} человек). Ты пока без команды — "
+                             "создай свою, попросись в чужую или выбери «Нет команды» в мини аппе, во вкладке «Хакатоны».")
         if h["my_best"] is not None:
-            lines.append(f"Твой лучший результат: {fmt_score(h['my_best'])}")
+            lines.append(f"{'Лучший результат команды' if h.get('team') else 'Твой лучший результат'}: {fmt_score(h['my_best'])}")
         names = {"train": "📊 train", "test": "🧪 test", "baseline": "🧩 baseline", "task": "📄 условие"}
         btns = [InlineKeyboardButton(text=names[k], callback_data=f"hf:{h['id']}:{k}") for k in names if k in h["files"]]
         rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
@@ -580,6 +596,27 @@ def build_dispatcher(service: HomeworkService, webapp_url: str = "") -> Dispatch
             lines.append(f"№{x['number']} · {fmt_dt(datetime.fromisoformat(x['created_at']), tz)} · {res}")
         await cb.message.answer("\n".join(lines))
         await cb.answer()
+
+    @router.callback_query(F.data.startswith("treq:"))
+    async def team_request_cb(cb: CallbackQuery):
+        """Кнопки «Принять / Отклонить» под приглашением в команду или заявкой капитану."""
+        _, action, rid = cb.data.split(":")
+        try:
+            r = await hacks.teams.decide(int(rid), cb.from_user.id, action)
+        except ServiceError as e:
+            await cb.answer(str(e), show_alert=True)
+            with contextlib.suppress(Exception):
+                await cb.message.edit_reply_markup(reply_markup=None)
+            return
+        if r["kind"] == "invite":
+            note = (f"✅ Ты в команде «{escape(r['team_name'])}». Состав и лидерборд — в мини аппе."
+                    if r["status"] == "accepted" else "Приглашение отклонено.")
+        else:
+            note = (f"✅ {escape(r['user_name'])} теперь в команде." if r["status"] == "accepted"
+                    else f"Заявка от {escape(r['user_name'])} отклонена.")
+        with contextlib.suppress(Exception):
+            await cb.message.edit_text(f"{cb.message.html_text}\n\n{note}", reply_markup=None)
+        await cb.answer("Готово")
 
     async def hackathon_csv(message: Message, bot: Bot) -> None:
         h = await current_hackathon(message.from_user.id)
