@@ -41,6 +41,14 @@ else
   echo "Подкачка уже есть, пропускаю."
 fi
 
+step "Ограничиваю системные логи (200 МБ), чтобы не съели маленький диск"
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/00-dsc-size.conf <<'CONF'
+[Journal]
+SystemMaxUse=200M
+CONF
+systemctl restart systemd-journald
+
 step "Файрвол: открыты только SSH, HTTP и HTTPS"
 ufw allow OpenSSH
 ufw allow 80/tcp

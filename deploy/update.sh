@@ -12,7 +12,9 @@ git pull --ff-only
 echo "==> Пересобираю и перезапускаю"
 mkdir -p data && chown -R 1000:1000 data 2>/dev/null || true
 docker compose up -d --build
+# Старые образы и кэш сборки занимают сотни МБ после каждого обновления
 docker image prune -f >/dev/null
+docker builder prune -f --filter until=72h >/dev/null
 
 echo "==> Статус"
 docker compose ps

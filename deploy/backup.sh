@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Бэкап SQLite-базы и загруженных файлов в ./backups (хранится 14 дней).
+# Бэкап SQLite-базы и загруженных файлов в ./backups (хранится KEEP_DAYS дней, по умолчанию 7).
+# Если на диске остаётся меньше MIN_FREE_MB, самые старые архивы удаляются раньше (последний не трогается).
 # Если в .env задан BACKUP_CHAT_ID, архив до 49 МБ ещё и отправляется туда ботом (копия вне сервера).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-KEEP_DAYS="${KEEP_DAYS:-14}"
+KEEP_DAYS="${KEEP_DAYS:-7}"
+MIN_FREE_MB="${MIN_FREE_MB:-2048}"
 STAMP="$(date -u +%Y-%m-%d_%H%M)"
 OUT="backups/dsc-bot_$STAMP.tar.gz"
 mkdir -p backups
@@ -33,6 +35,14 @@ chmod 600 "$OUT"
 echo "$(date -u '+%F %T') бэкап: $OUT ($(du -h "$OUT" | cut -f1))"
 
 find backups -name 'dsc-bot_*.tar.gz' -mtime +"$KEEP_DAYS" -delete
+
+free_mb() { df -Pm . | awk 'NR==2 {print $4}'; }
+while (( $(free_mb) < MIN_FREE_MB )); do
+  mapfile -t OLD < <(ls -1 backups/dsc-bot_*.tar.gz | sort)
+  (( ${#OLD[@]} > 1 )) || { echo "Мало места на диске ($(free_mb) МБ свободно), а удалять больше нечего!" >&2; break; }
+  echo "Мало места ($(free_mb) МБ), удаляю старый бэкап ${OLD[0]}"
+  rm -f "${OLD[0]}"
+done
 
 env_get() { grep -E "^$1=" .env 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '"'"'"; }
 CHAT_ID="$(env_get BACKUP_CHAT_ID || true)"
