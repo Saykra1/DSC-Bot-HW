@@ -176,13 +176,30 @@ function toast(text, kind = "ok") {
   hap(kind === "err" ? "error" : "success");
 }
 
+// Внутри Telegram blob-ссылки не скачиваются (телефон) или скачиваются через раз (компьютер),
+// поэтому файл отдаём самому Telegram по короткой подписанной ссылке: нативное окно «Скачать»
+// (Bot API 8.0+), а в старых клиентах — открываем ссылку во внешнем браузере.
+let downloading = false;
 async function download(path, name) {
+  if (downloading) return;
+  downloading = true;
   try {
+    if (initData && tg?.platform && tg.platform !== "unknown") {
+      const { url } = await api("/download-link", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }),
+      });
+      const href = new URL(url, location.href).href;
+      if (tg.downloadFile && tg.isVersionAtLeast?.("8.0")) tg.downloadFile({ url: href, file_name: name });
+      else tg.openLink(href);
+      return;
+    }
     const blob = await api(path);
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob); a.download = name; a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    a.href = URL.createObjectURL(blob); a.download = name; a.hidden = true;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
   } catch (e) { toast(e.message, "err"); }
+  finally { downloading = false; }
 }
 async function sendFile(path, okText) {
   try { await api(path, { method: "POST" }); toast(okText); } catch (e) { toast(e.message, "err"); }
