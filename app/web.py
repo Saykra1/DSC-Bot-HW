@@ -1,6 +1,9 @@
 """API и статика мини аппа (FastAPI)."""
 
 
+import base64
+import hashlib
+import hmac
 import json
 import time
 from dataclasses import dataclass
@@ -12,7 +15,7 @@ from urllib.parse import quote
 from aiogram import Bot
 from aiogram.types import BufferedInputFile
 from aiogram.utils.web_app import safe_parse_webapp_init_data
-from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,6 +27,35 @@ from app.service import HomeworkService, ServiceError, has_notebook, reference_a
 
 STATIC = Path(__file__).parent / "static"
 INIT_DATA_MAX_AGE = 24 * 3600
+DOWNLOAD_LINK_TTL = 5 * 60
+# Telegram Web (web.telegram.org) качает файл через fetch из своего окна, поэтому ему нужен CORS
+TELEGRAM_WEB_ORIGIN = "https://web.telegram.org"
+
+
+def _link_sig(key: bytes, uid: int, exp: int, path: str) -> str:
+    mac = hmac.new(key, f"{uid}|{exp}|{path}".encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac[:18]).decode()
+
+
+def make_download_token(key: bytes, uid: int, path: str, ttl: int = DOWNLOAD_LINK_TTL) -> str:
+    """Одноразовая по смыслу ссылка: работает только для этого пути, этого пользователя и несколько минут."""
+    exp = int(time.time()) + ttl
+    return f"{uid}.{exp}.{_link_sig(key, uid, exp, path)}"
+
+
+def check_download_token(key: bytes, token: str, path: str) -> int | None:
+    try:
+        uid_s, exp_s, sig = token.split(".", 2)
+        uid, exp = int(uid_s), int(exp_s)
+    except ValueError:
+        return None
+    if exp < time.time() or not hmac.compare_digest(sig, _link_sig(key, uid, exp, path)):
+        return None
+    return uid
+
+
+class DownloadLinkIn(BaseModel):
+    path: str
 
 
 class ProfileIn(BaseModel):
@@ -128,7 +160,20 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
             return None
         return parse_dt(value, what)
 
-    async def current_user(x_telegram_init_data: Annotated[str, Header()] = "") -> CurrentUser:
+    link_key = hashlib.sha256(b"download-link:" + settings.bot_token.encode()).digest()
+
+    async def current_user(
+        request: Request,
+        x_telegram_init_data: Annotated[str, Header()] = "",
+        dl: Annotated[str | None, Query(include_in_schema=False)] = None,
+    ) -> CurrentUser:
+        if not x_telegram_init_data and dl and request.method == "GET":
+            # Ссылка для скачивания (Telegram.WebApp.downloadFile): заголовков у такого запроса нет,
+            # поэтому пользователь берётся из подписанной ссылки, выданной /api/download-link
+            uid = check_download_token(link_key, dl, request.url.path)
+            if uid is None:
+                raise HTTPException(401, "Ссылка для скачивания устарела, нажми кнопку ещё раз")
+            return CurrentUser(uid, service.is_admin(uid))
         if x_telegram_init_data:
             try:
                 data = safe_parse_webapp_init_data(settings.bot_token, x_telegram_init_data)
@@ -161,6 +206,16 @@ def build_api(service: HomeworkService, bot: Bot | None) -> APIRouter:
 
     def err(e: ServiceError) -> HTTPException:
         return HTTPException(400, str(e))
+
+    @api.post("/download-link")
+    async def download_link(body: DownloadLinkIn, user: UserDep):
+        """Подписанная ссылка на файл из API. Её открывает сам Telegram (downloadFile / openLink):
+        скачивание blob-ссылкой внутри WebView на телефонах не работает, а на компьютере работает через раз."""
+        path = body.path
+        if not path.startswith("/") or "?" in path or "#" in path or ".." in path or len(path) > 300:
+            raise HTTPException(400, "Неверный путь")
+        full = "/api" + path
+        return {"url": f"{full}?dl={make_download_token(link_key, user.id, full)}"}
 
     @api.get("/me")
     async def me(user: UserDep):
@@ -683,6 +738,14 @@ def build_app(service: HomeworkService, bot: Bot | None, lifespan=None) -> FastA
     app.include_router(build_api(service, bot))
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+    @app.middleware("http")
+    async def download_headers(request: Request, call_next):
+        response = await call_next(request)
+        if "dl" in request.query_params and request.url.path.startswith("/api/"):
+            response.headers["Access-Control-Allow-Origin"] = TELEGRAM_WEB_ORIGIN
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/")
     async def index():
